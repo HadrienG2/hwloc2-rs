@@ -1931,6 +1931,7 @@ mod tests {
     use super::*;
     #[allow(unused)]
     use similar_asserts::assert_eq;
+    use std::cmp::Ordering;
 
     #[test]
     fn builtin_attributes() {
@@ -1956,12 +1957,60 @@ mod tests {
                     .count(),
                 1
             );
+            let higher_is_best = flags.contains(MemoryAttributeFlags::HIGHER_IS_BEST);
             let has_initiator = flags.contains(MemoryAttributeFlags::NEED_INITIATOR);
 
-            // TODO: Test other things
+            let (target_nodes, maybe_values) = attr.targets(None).unwrap();
+
+            if has_initiator {
+                // Memory attributes with initiators
+                assert!(maybe_values.is_none());
+                // TODO: Handle this case. Need to...
+                // - Call attr.initiators() for each target to get initiator and
+                //   attribute values
+                // - Check output of attr.value() for each (initiator, target)
+                //   pair
+                // - Check output of best_initiator(). To do this, I should
+                //   extract a generic version of the expected_best_xyz
+                //   computation from the no-initiators case below.
+                // - Build a map from initiator to targets and associated values
+                //   while iterating over targets, then later...
+                // - Check output of attr.targets() for each initiator
+                // - Check output of attr.best_target() for each initiator.
+                unimplemented!();
+            } else {
+                // Memory attributes without initiators
+                let values_via_targets = maybe_values.unwrap();
+                let mut expected_best_value = if higher_is_best { u64::MIN } else { u64::MAX };
+                let mut expected_best_nodes = Vec::new();
+                for (node, value_via_targets) in
+                    target_nodes.iter().copied().zip(values_via_targets)
+                {
+                    let value_via_method = attr.value(None, node).unwrap();
+                    assert_eq!(value_via_method, value_via_targets);
+                    match (higher_is_best, value_via_method.cmp(&expected_best_value)) {
+                        (true, Ordering::Greater) | (false, Ordering::Less) => {
+                            expected_best_value = value_via_method;
+                            expected_best_nodes.clear();
+                            expected_best_nodes.push(node);
+                        }
+                        (_, Ordering::Equal) => {
+                            expected_best_nodes.push(node);
+                        }
+                        _ => {}
+                    }
+                }
+                let best_target = attr.best_target(None).unwrap();
+                assert_eq!(expected_best_nodes.is_empty(), best_target.is_none());
+                if let Some((best_node, best_value)) = best_target {
+                    assert_eq!(best_value, expected_best_value);
+                    assert!(expected_best_nodes
+                        .iter()
+                        .any(|node| node.global_persistent_index()
+                            == best_node.global_persistent_index()));
+                }
+            }
         }
-        // TODO: Remove once done
-        unimplemented!()
     }
 
     // TODO: Test other memattr functionality
