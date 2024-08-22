@@ -1209,17 +1209,26 @@ impl<'topology> MemoryAttribute<'topology> {
     }
 
     /// Target NUMA nodes that have some values for a given attribute, along
-    /// with the associated values.
+    /// with the associated values if possible.
     ///
     /// An `initiator` may only be specified if this attribute has the flag
-    /// [`MemoryAttributeFlags::NEED_INITIATOR`]. In that case, it acts as a
-    /// filter to only report targets that have a value for this initiator.
+    /// [`MemoryAttributeFlags::NEED_INITIATOR`]. In that case, specifying an
+    /// initiator is optional and does two things:
+    ///
+    /// 1. It acts as a filter to only report targets that have a value for this
+    ///    initiator.
+    /// 2. It reports the memory attribute values for each listed target and
+    ///    this initiator. Otherwise no values are reported, i.e. the output
+    ///    `Option<Vec<u64>>` is `None`.
     ///
     /// The initiator should be a [`CpuSet`] when refering to accesses performed
     /// by CPU cores. [`MemoryAttributeLocation::Object`] is currently unused
     /// internally by hwloc, but user-defined memory attributes may for instance
     /// use it to provide custom information about host memory accesses
     /// performed by GPUs.
+    ///
+    /// In the case of memory attributes that have no initiators, `initiator`
+    /// should be `None`, and memory attribute values will always be reported.
     ///
     /// This function is meant for tools and debugging (listing internal
     /// information) rather than for application queries. Applications should
@@ -1230,20 +1239,20 @@ impl<'topology> MemoryAttribute<'topology> {
     ///
     /// - [`ForeignInitiator`] if the `initiator` parameter was set to a
     ///   [`TopologyObject`] that does not belong to this topology
-    /// - [`NeedInitiator`] if no `initiator` was provided but this memory
-    ///   attribute needs one
     /// - [`UnwantedInitiator`] if an `initiator` was provided but this memory
     ///   attribute doesn't need one
     ///
     /// [`ForeignInitiator`]: InitiatorInputError::ForeignInitiator
-    /// [`NeedInitiator`]: InitiatorInputError::NeedInitiator
     /// [`UnwantedInitiator`]: InitiatorInputError::UnwantedInitiator
     #[doc(alias = "hwloc_memattr_get_targets")]
     pub fn targets(
         &self,
         initiator: Option<MemoryAttributeLocation<'_>>,
-    ) -> Result<(Vec<&'topology TopologyObject>, Vec<u64>), HybridError<InitiatorInputError>> {
+    ) -> Result<(Vec<&'topology TopologyObject>, Option<Vec<u64>>), HybridError<InitiatorInputError>>
+    {
         // Validate the query + translate initiator to hwloc format
+        let get_values =
+            initiator.is_some() || !self.flags().contains(MemoryAttributeFlags::NEED_INITIATOR);
         // SAFETY: - Will only be used before returning from this function,
         //         - get_targets is documented to accept a NULL initiator
         let initiator = unsafe { self.checked_initiator(initiator, true)? };
@@ -1257,6 +1266,7 @@ impl<'topology> MemoryAttribute<'topology> {
             self.array_query(
                 "hwloc_memattr_get_targets",
                 ptr::null(),
+                get_values,
                 |topology, attribute, flags, nr, targets, values| {
                     hwlocality_sys::hwloc_memattr_get_targets(
                         topology, attribute, &initiator, flags, nr, targets, values,
@@ -1272,6 +1282,7 @@ impl<'topology> MemoryAttribute<'topology> {
             // SAFETY: Targets originate from a query against this topology
             .map(|node_ptr| unsafe { self.encapsulate_target_node(node_ptr) })
             .collect();
+        let values = (!values.is_empty()).then_some(values);
         Ok((targets, values))
     }
 
@@ -1307,6 +1318,7 @@ impl<'topology> MemoryAttribute<'topology> {
             self.array_query(
                 "hwloc_memattr_get_initiators",
                 NULL_LOCATION,
+                true,
                 |topology, attribute, flags, nr, initiators, values| {
                     hwlocality_sys::hwloc_memattr_get_initiators(
                         topology,
@@ -1333,6 +1345,11 @@ impl<'topology> MemoryAttribute<'topology> {
 
     /// Perform a `get_targets` style memory attribute query
     ///
+    /// `get_values` indicates whether the caller is interested in associated
+    /// memory attribute values. If so, the output `Vec<u64>` will be filled
+    /// with as many values as the number of initiators/targets, if not it will
+    /// be an empty `Vec`.
+    ///
     /// # Safety
     ///
     /// `query` must be one of the `hwloc_memattr_<plural>` queries, with the
@@ -1349,6 +1366,7 @@ impl<'topology> MemoryAttribute<'topology> {
         &self,
         api: &'static str,
         placeholder: Endpoint,
+        get_values: bool,
         mut query: impl FnMut(
             hwloc_const_topology_t,
             hwloc_memattr_id_t,
@@ -1378,20 +1396,29 @@ impl<'topology> MemoryAttribute<'topology> {
             })
         };
 
-        // Allocate arrays of endpoints and values
+        // Determine the right size for arrays of endpoints and values
         // SAFETY: 1 elements + throw-away buffers is the correct way to request
         //         the buffer size to be allocated from hwloc
         let mut nr = 1;
         call_ffi(&mut nr, [placeholder].as_mut_ptr(), [u64::MAX].as_mut_ptr())?;
         let len = int::expect_usize(nr);
         let mut endpoints = vec![placeholder; len];
-        let mut values = vec![u64::MAX; len];
 
-        // Let hwloc fill the arrays
+        // Get the values if requested
         let old_nr = nr;
-        // SAFETY: - endpoints and values are indeed arrays of nr = len elements
-        //         - Input array contents don't matter as this is an out-parameter
-        call_ffi(&mut nr, endpoints.as_mut_ptr(), values.as_mut_ptr())?;
+        let values = if get_values {
+            let mut values = vec![u64::MAX; len];
+            // SAFETY: - endpoints and values are indeed arrays of nr = len elements
+            //         - Input array contents don't matter as this is an out-parameter
+            call_ffi(&mut nr, endpoints.as_mut_ptr(), values.as_mut_ptr())?;
+            values
+        } else {
+            // SAFETY: - endpoints is indeed an array of nr = len elements,
+            //           values can be null to indicate lack of interest
+            //         - Input array contents don't matter as this is an out-parameter
+            call_ffi(&mut nr, endpoints.as_mut_ptr(), ptr::null_mut())?;
+            Vec::new()
+        };
         assert_eq!(old_nr, nr, "Inconsistent node count from hwloc");
         Ok((endpoints, values))
     }
