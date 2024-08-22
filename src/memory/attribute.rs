@@ -1278,8 +1278,6 @@ impl<'topology> MemoryAttribute<'topology> {
     /// Initiators that have values for a given attribute for a specific target
     /// NUMA node, along with the associated values
     ///
-    /// If this memory attribute has no initiator, an empty list is returned.
-    ///
     /// This function is meant for tools and debugging (listing internal
     /// information) rather than for application queries. Applications should
     /// rather select useful NUMA nodes with [`Topology::local_numa_nodes()`]
@@ -1900,3 +1898,44 @@ impl MemoryAttributeFlags {
 }
 //
 crate::impl_arbitrary_for_bitflags!(MemoryAttributeFlags, hwloc_memattr_flag_e);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused)]
+    use similar_asserts::assert_eq;
+
+    #[test]
+    fn builtin_attributes() {
+        let topology = Topology::test_instance();
+        for attr in MemoryAttribute::BUILTIN_ATTRIBUTES {
+            let attr = attr(&topology);
+
+            let name = attr.name().to_str().unwrap();
+            let by_name = topology
+                .memory_attribute_named(name)
+                .expect("Builtin attributes should not have a NUL in their name")
+                .expect("Builtin attributes should be present");
+            assert!(ptr::eq(by_name.topology, attr.topology));
+            assert_eq!(by_name.id, attr.id);
+
+            let flags = attr.flags();
+            assert_eq!(
+                flags
+                    .intersection(
+                        MemoryAttributeFlags::HIGHER_IS_BEST | MemoryAttributeFlags::LOWER_IS_BEST
+                    )
+                    .iter()
+                    .count(),
+                1
+            );
+            let has_initiator = flags.contains(MemoryAttributeFlags::NEED_INITIATOR);
+
+            // TODO: Test other things
+        }
+        // TODO: Remove once done
+        unimplemented!()
+    }
+
+    // TODO: Test other memattr functionality
+}
