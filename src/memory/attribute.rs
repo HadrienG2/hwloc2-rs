@@ -1105,7 +1105,7 @@ impl<'topology> MemoryAttribute<'topology> {
                 // As explained in the RawHwlocError documentation, errno values
                 // may not correctly propagate from hwloc to hwlocality on
                 // Windows. But only EINVAL is expected here so we're fine.
-                Ok(None);
+                Ok(None)
             }
             Err(other_err) => Err(HybridError::Hwloc(other_err)),
         }
