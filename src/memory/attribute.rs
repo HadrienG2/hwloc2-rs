@@ -2375,7 +2375,8 @@ mod tests {
             // Avoid invalid value() calls which are not caught by hwloc's error
             // handling, resulting in segfaults until
             // https://github.com/open-mpi/hwloc/issues/685 is resolved.
-            if attr.name() == c"Locality" && target.cpuset().is_none() {
+            let locality_name = CString::new("Locality").unwrap();
+            if attr.name() == locality_name.as_c_str() && target.cpuset().is_none() {
                 return Ok(());
             }
 
