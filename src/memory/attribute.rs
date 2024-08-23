@@ -389,7 +389,7 @@ impl<'topology> NodeAttributeDump<'topology> {
         } else {
             attribute
                 .value(None, numa)
-                .map(|value| (None, vec![value]))
+                .map(|value| (None, value.map_or_else(Vec::new, |value| vec![value])))
                 .map_err(|e| {
                     e.expect_only_hwloc(
                         "shouldn't happen because this attribute \
@@ -1026,7 +1026,8 @@ impl<'topology> MemoryAttribute<'topology> {
         }
     }
 
-    /// Value of this attribute for a specific initiator and target NUMA node
+    /// Value of this attribute for a specific initiator and target NUMA node,
+    /// if any.
     ///
     /// `initiator` should be specified if and only if this attribute has the
     /// flag [`MemoryAttributeFlags::NEED_INITIATOR`].
@@ -1057,7 +1058,7 @@ impl<'topology> MemoryAttribute<'topology> {
         &self,
         initiator: Option<MemoryAttributeLocation<'_>>,
         target_node: &TopologyObject,
-    ) -> Result<u64, HybridError<ValueQueryError>> {
+    ) -> Result<Option<u64>, HybridError<ValueQueryError>> {
         // Check and translate initiator argument
         // SAFETY: Will only be used before returning from this function
         let initiator = unsafe {
@@ -1080,7 +1081,7 @@ impl<'topology> MemoryAttribute<'topology> {
         //           to be NULL if and only if the attribute has no initiator
         //         - flags must be 0
         //         - Value is an out parameter, its initial value isn't read
-        errors::call_hwloc_int_normal("hwloc_memattr_get_value", || unsafe {
+        let res = errors::call_hwloc_int_normal("hwloc_memattr_get_value", || unsafe {
             hwlocality_sys::hwloc_memattr_get_value(
                 self.topology.as_ptr(),
                 self.id,
@@ -1089,9 +1090,25 @@ impl<'topology> MemoryAttribute<'topology> {
                 0,
                 &mut value,
             )
-        })
-        .map(|_| value)
-        .map_err(HybridError::Hwloc)
+        });
+        match res {
+            Ok(_) => Ok(Some(value)),
+            // We should have handled all sources of EINVAL besides calling
+            // value() with an (initiator, target_node) for which there is no
+            // memory attribute value, so returning None feels appropriate here.
+            Err(RawHwlocError {
+                errno: Some(Errno(EINVAL)),
+                ..
+            }) => Ok(None),
+            #[cfg(windows)]
+            Err(RawHwlocError { errno: None, .. }) => {
+                // As explained in the RawHwlocError documentation, errno values
+                // may not correctly propagate from hwloc to hwlocality on
+                // Windows. But only EINVAL is expected here so we're fine.
+                Ok(None);
+            }
+            Err(other_err) => Err(HybridError::Hwloc(other_err)),
+        }
     }
 
     /// Best target node and associated attribute value, if any, for a given initiator
@@ -1244,6 +1261,7 @@ impl<'topology> MemoryAttribute<'topology> {
     ///
     /// [`ForeignInitiator`]: InitiatorInputError::ForeignInitiator
     /// [`UnwantedInitiator`]: InitiatorInputError::UnwantedInitiator
+    #[allow(clippy::type_complexity)]
     #[doc(alias = "hwloc_memattr_get_targets")]
     pub fn targets(
         &self,
@@ -1400,9 +1418,38 @@ impl<'topology> MemoryAttribute<'topology> {
         // SAFETY: 1 elements + throw-away buffers is the correct way to request
         //         the buffer size to be allocated from hwloc
         let mut nr = 1;
-        call_ffi(&mut nr, [placeholder].as_mut_ptr(), [u64::MAX].as_mut_ptr())?;
+        let res = call_ffi(&mut nr, [placeholder].as_mut_ptr(), [u64::MAX].as_mut_ptr());
         let len = int::expect_usize(nr);
         let mut endpoints = vec![placeholder; len];
+
+        // At the time of writing, all error cases of hwloc_memattr_get_targets
+        // are either avoided through API design or checked before attempting to
+        // call array_query(), so errors can only emerged through hwloc changes.
+        // But this is not true for hwloc_memattr_get_initiators. In that case,
+        // EINVAL is returned if the specified target has no memory attribute
+        // attached to it. This is only subtly different from having a memory
+        // attribute defined for this target, but no value/initiator attached,
+        // which yields no errors (just an empty initiator/value list), so we
+        // choose to handle it identically by returning an empty list.
+        if api == "hwloc_memattr_get_initiators" {
+            match res {
+                Ok(_positive) => {}
+                Err(RawHwlocError {
+                    errno: Some(Errno(EINVAL)),
+                    ..
+                }) => return Ok((Vec::new(), Vec::new())),
+                #[cfg(windows)]
+                Err(RawHwlocError { errno: None, .. }) => {
+                    // As explained in the RawHwlocError documentation, errno values
+                    // may not correctly propagate from hwloc to hwlocality on
+                    // Windows. But only EINVAL is expected here so we're fine.
+                    return Ok((Vec::new(), Vec::new()));
+                }
+                Err(other_err) => return Err(other_err),
+            }
+        } else {
+            res?;
+        }
 
         // Get the values if requested
         let old_nr = nr;
@@ -1442,25 +1489,45 @@ impl<'topology> MemoryAttribute<'topology> {
         query: impl FnOnce(hwloc_const_topology_t, hwloc_memattr_id_t, c_ulong, *mut u64) -> c_int,
     ) -> Option<u64> {
         /// Polymorphized subset of this function (avoids generics code bloat)
-        fn process_result(final_value: u64, result: Result<c_uint, RawHwlocError>) -> Option<u64> {
+        fn process_result(
+            api: &'static str,
+            final_value: u64,
+            result: Result<c_uint, RawHwlocError>,
+        ) -> Option<u64> {
             match result {
                 Ok(_positive) => Some(final_value),
                 Err(RawHwlocError {
                     errno: Some(Errno(ENOENT)),
                     ..
                 }) => None,
-                // All cases other than "no such attribute" should be handled by the caller
+                // EINVAL can mean several different things here:
+                // - Queried an initiator on a memory attribute that doesn't
+                //   have them. This error is handled before calling this, so we
+                //   should never observe an associated EINVAL.
+                // - Flags are nonzero. We prevent this by not letting the user
+                //   set flags.
+                // - Memory attribute ID is invalid. We prevent this by not
+                //   letting the user create a MemoryAttribute with an invalid
+                //   ID.
+                // - Requested best initiator on a target that is not associated
+                //   with this memory attribute. This error is only subtly
+                //   different fom ENOENT which means that the target is
+                //   registered but no initiator is registered. This is also
+                //   inconsistent with best_target queries which return ENOENT
+                //   in the case of a nonexistent initiator. Since Windows may
+                //   not know the difference anyway (see below), we do not
+                //   expose this distinction in the API and handle every case
+                //   where there is no "best X for this Y" by returning None.
                 Err(RawHwlocError {
                     errno: Some(Errno(EINVAL)),
                     ..
-                }) => unreachable!("Parameters should have been checked by the caller"),
+                }) if api == "hwloc_memattr_get_best_initiator" => None,
                 #[cfg(windows)]
                 Err(RawHwlocError { errno: None, .. }) => {
                     // As explained in the RawHwlocError documentation, errno values
                     // may not correctly propagate from hwloc to hwlocality on
-                    // Windows. Since EINVAL should not occur here, only ENOENT
-                    // is expected here, so we'll interpret lack of errno as
-                    // ENOENT on Windows.
+                    // Windows. But only EINVAL and ENOENT are expected here,
+                    // and we handle them identically above, so we're fine.
                     None
                 }
                 Err(raw_err) => unreachable!("Unexpected hwloc error: {raw_err}"),
@@ -1477,7 +1544,7 @@ impl<'topology> MemoryAttribute<'topology> {
             //         - value is an out-parameter, input value doesn't matter
             query(self.topology.as_ptr(), self.id, 0, &mut value)
         });
-        process_result(value, result)
+        process_result(api, value, result)
     }
 
     /// Encapsulate a `*const TopologyObject` to a target NUMA node from hwloc
@@ -1929,15 +1996,77 @@ crate::impl_arbitrary_for_bitflags!(MemoryAttributeFlags, hwloc_memattr_flag_e);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        object::TopologyObjectID,
+        strategies::{any_object, any_string, set_with_reference, topology_related_set},
+    };
+    use proptest::prelude::*;
     #[allow(unused)]
     use similar_asserts::assert_eq;
-    use std::cmp::Ordering;
+    use std::{
+        cmp::Ordering,
+        collections::{HashMap, HashSet},
+        ffi::CString,
+    };
 
+    /// Mechanism to track the best value of a memory attribute and the
+    /// endpoints for which the memory attribute has this value.
+    struct BestValueEndpoints<Endpoint> {
+        higher_is_best: bool,
+        best_value: u64,
+        best_endpoints: Vec<Endpoint>,
+    }
+    //
+    impl<Endpoint: Copy> BestValueEndpoints<Endpoint> {
+        fn new(higher_is_best: bool) -> Self {
+            Self {
+                higher_is_best,
+                best_value: if higher_is_best { u64::MIN } else { u64::MAX },
+                best_endpoints: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, endpoint: Endpoint, value: u64) {
+            match (self.higher_is_best, value.cmp(&self.best_value)) {
+                (true, Ordering::Greater) | (false, Ordering::Less) => {
+                    self.best_value = value;
+                    self.best_endpoints.clear();
+                    self.best_endpoints.push(endpoint);
+                }
+                (_, Ordering::Equal) => {
+                    self.best_endpoints.push(endpoint);
+                }
+                _ => {}
+            }
+        }
+
+        fn collect_value_and_endpoints(self) -> Option<(Vec<Endpoint>, u64)> {
+            (!self.best_endpoints.is_empty()).then_some((self.best_endpoints, self.best_value))
+        }
+    }
+
+    /// Unique initiator identifier
+    #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+    enum InitiatorKey<'a> {
+        CpuSet(BitmapRef<'a, CpuSet>),
+        Object(TopologyObjectID),
+    }
+    //
+    impl<'a> From<MemoryAttributeLocation<'a>> for InitiatorKey<'a> {
+        fn from(x: MemoryAttributeLocation<'a>) -> Self {
+            match x {
+                MemoryAttributeLocation::CpuSet(set) => Self::CpuSet(set),
+                MemoryAttributeLocation::Object(obj) => Self::Object(obj.global_persistent_index()),
+            }
+        }
+    }
+
+    /// Test built-in memory attributes for all queries that should succeed
     #[test]
-    fn builtin_attributes() {
+    fn builtin_attributes_successes() {
         let topology = Topology::test_instance();
         for attr in MemoryAttribute::BUILTIN_ATTRIBUTES {
-            let attr = attr(&topology);
+            let attr = attr(topology);
 
             let name = attr.name().to_str().unwrap();
             let by_name = topology
@@ -1957,59 +2086,411 @@ mod tests {
                     .count(),
                 1
             );
-            let higher_is_best = flags.contains(MemoryAttributeFlags::HIGHER_IS_BEST);
-            let has_initiator = flags.contains(MemoryAttributeFlags::NEED_INITIATOR);
 
-            let (target_nodes, maybe_values) = attr.targets(None).unwrap();
-
-            if has_initiator {
-                // Memory attributes with initiators
-                assert!(maybe_values.is_none());
-                // TODO: Handle this case. Need to...
-                // - Call attr.initiators() for each target to get initiator and
-                //   attribute values
-                // - Check output of attr.value() for each (initiator, target)
-                //   pair
-                // - Check output of best_initiator(). To do this, I should
-                //   extract a generic version of the expected_best_xyz
-                //   computation from the no-initiators case below.
-                // - Build a map from initiator to targets and associated values
-                //   while iterating over targets, then later...
-                // - Check output of attr.targets() for each initiator
-                // - Check output of attr.best_target() for each initiator.
-                unimplemented!();
+            if flags.contains(MemoryAttributeFlags::NEED_INITIATOR) {
+                test_targets_with_initiators(attr);
             } else {
-                // Memory attributes without initiators
-                let values_via_targets = maybe_values.unwrap();
-                let mut expected_best_value = if higher_is_best { u64::MIN } else { u64::MAX };
-                let mut expected_best_nodes = Vec::new();
-                for (node, value_via_targets) in
-                    target_nodes.iter().copied().zip(values_via_targets)
-                {
-                    let value_via_method = attr.value(None, node).unwrap();
-                    assert_eq!(value_via_method, value_via_targets);
-                    match (higher_is_best, value_via_method.cmp(&expected_best_value)) {
-                        (true, Ordering::Greater) | (false, Ordering::Less) => {
-                            expected_best_value = value_via_method;
-                            expected_best_nodes.clear();
-                            expected_best_nodes.push(node);
-                        }
-                        (_, Ordering::Equal) => {
-                            expected_best_nodes.push(node);
-                        }
-                        _ => {}
+                test_targets_wo_initiators(attr);
+            }
+        }
+    }
+
+    /// Target and initiator testing for memory attributes that need an
+    /// initiator
+    fn test_targets_with_initiators(attr_with_initiator: MemoryAttribute<'_>) {
+        // Check basic attribute properties and query targets
+        let attr = attr_with_initiator;
+        let higher_is_best = attr.flags().contains(MemoryAttributeFlags::HIGHER_IS_BEST);
+        let (target_nodes, no_values) = attr.targets(None).unwrap();
+        assert!(no_values.is_none());
+
+        // For each target...
+        let mut key_to_initiator = HashMap::new();
+        let mut initiator_key_to_target_ids_and_values = HashMap::<_, HashSet<_>>::new();
+        for target in target_nodes {
+            // Check initiators, collect best initiator and targets for
+            // each initiator
+            let (initiators, values) = attr.initiators(target).unwrap();
+            let mut expected_best_initiators = BestValueEndpoints::new(higher_is_best);
+            for (initiator, value) in initiators.into_iter().zip(values) {
+                assert_eq!(attr.value(Some(initiator), target), Ok(Some(value)));
+                let initiator_key = InitiatorKey::from(initiator);
+                key_to_initiator.insert(initiator_key, initiator);
+                let inserted = initiator_key_to_target_ids_and_values
+                    .entry(initiator_key)
+                    .or_default()
+                    .insert((target.global_persistent_index(), value));
+                assert!(inserted);
+                expected_best_initiators.push(initiator, value);
+            }
+
+            // Check best initiator
+            let expected_best_initiators = expected_best_initiators.collect_value_and_endpoints();
+            let best_initiator = attr.best_initiator(target).unwrap();
+            assert_eq!(expected_best_initiators.is_none(), best_initiator.is_none());
+            if let (
+                Some((expected_best_initiators, expected_best_value)),
+                Some((best_initiator, best_value)),
+            ) = (expected_best_initiators, best_initiator)
+            {
+                assert_eq!(best_value, expected_best_value);
+                assert!(expected_best_initiators.into_iter().any(|initiator| {
+                    match (initiator, best_initiator) {
+                        (
+                            MemoryAttributeLocation::CpuSet(set1),
+                            MemoryAttributeLocation::CpuSet(set2),
+                        ) => set1 == set2,
+                        (
+                            MemoryAttributeLocation::Object(obj1),
+                            MemoryAttributeLocation::Object(obj2),
+                        ) => obj1.global_persistent_index() == obj2.global_persistent_index(),
+                        _ => false,
                     }
-                }
-                let best_target = attr.best_target(None).unwrap();
-                assert_eq!(expected_best_nodes.is_empty(), best_target.is_none());
-                if let Some((best_node, best_value)) = best_target {
-                    assert_eq!(best_value, expected_best_value);
-                    assert!(expected_best_nodes
-                        .iter()
-                        .any(|node| node.global_persistent_index()
-                            == best_node.global_persistent_index()));
+                }));
+            }
+        }
+
+        // For each initiator...
+        for (initiator_key, target_ids_and_values) in initiator_key_to_target_ids_and_values {
+            // Check targets, find best targets
+            let initiator = key_to_initiator[&initiator_key];
+            let (targets, values) = attr.targets(Some(initiator)).unwrap();
+            let values = values.unwrap();
+            assert_eq!(targets.len(), values.len());
+            assert_eq!(targets.len(), target_ids_and_values.len());
+            let mut expected_best_targets = BestValueEndpoints::new(higher_is_best);
+            for (target, value) in targets.iter().zip(values) {
+                assert!(target_ids_and_values.contains(&(target.global_persistent_index(), value)));
+                expected_best_targets.push(target.global_persistent_index(), value);
+            }
+
+            // Check best target
+            let expected_best_targets = expected_best_targets.collect_value_and_endpoints();
+            let best_target = attr.best_target(Some(initiator)).unwrap();
+            assert_eq!(expected_best_targets.is_none(), best_target.is_none());
+            if let (
+                Some((expected_best_targets, expected_best_value)),
+                Some((best_target, best_value)),
+            ) = (expected_best_targets, best_target)
+            {
+                assert_eq!(best_value, expected_best_value);
+                assert!(expected_best_targets
+                    .into_iter()
+                    .any(|target_id| { best_target.global_persistent_index() == target_id }));
+            }
+        }
+    }
+
+    /// Target and initiator testing for memory attributes that have no
+    /// initiator
+    fn test_targets_wo_initiators(attr_wo_initiator: MemoryAttribute<'_>) {
+        // Check basic attribute properties and query targets
+        let attr = attr_wo_initiator;
+        let higher_is_best = attr.flags().contains(MemoryAttributeFlags::HIGHER_IS_BEST);
+        let (target_nodes, values) = attr.targets(None).unwrap();
+        let values_via_targets = values.unwrap();
+        assert_eq!(target_nodes.len(), values_via_targets.len());
+
+        // Check values, find best targets
+        let mut expected_best_targets = BestValueEndpoints::new(higher_is_best);
+        for (target, value) in target_nodes.into_iter().zip(values_via_targets) {
+            assert_eq!(attr.value(None, target), Ok(Some(value)));
+            expected_best_targets.push(target, value);
+        }
+
+        // Check best target
+        let expected_best_targets = expected_best_targets.collect_value_and_endpoints();
+        let best_target = attr.best_target(None).unwrap();
+        assert_eq!(expected_best_targets.is_none(), best_target.is_none());
+        if let (
+            Some((expected_best_targets, expected_best_value)),
+            Some((best_target, best_value)),
+        ) = (expected_best_targets, best_target)
+        {
+            assert_eq!(best_value, expected_best_value);
+            assert!(expected_best_targets
+                .into_iter()
+                .any(|target| target.global_persistent_index()
+                    == best_target.global_persistent_index()));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn memory_attribute_named(name in any_string()) {
+            let topology = Topology::test_instance();
+            let res = topology.memory_attribute_named(&name);
+
+            let name_contains_nul = name.chars().any(|c| c == '\0');
+            let Ok(maybe_attr) = res else {
+                prop_assert!(name_contains_nul);
+                return Ok(());
+            };
+            prop_assert!(!name_contains_nul);
+
+            if maybe_attr.is_none() {
+                let name = CString::new(name).unwrap();
+                for builtin_attr in MemoryAttribute::BUILTIN_ATTRIBUTES {
+                    let builtin_attr = builtin_attr(topology);
+                    prop_assert_ne!(builtin_attr.name(), name.as_c_str());
                 }
             }
+        }
+    }
+
+    /// Pick a memory attribute (only built-in ones supported for now as hwloc
+    /// lacks an entry point to query the list of memory attributes)
+    fn memory_attribute() -> impl Strategy<Value = MemoryAttribute<'static>> {
+        prop::sample::select(&MemoryAttribute::BUILTIN_ATTRIBUTES[..])
+            .prop_map(|constructor| constructor(Topology::test_instance()))
+    }
+
+    /// Pick a memory attribute and a target that has a chance of being correct
+    /// for this attribute, but may be a random object possibly coming from
+    /// another topology.
+    fn memory_attribute_and_target(
+    ) -> impl Strategy<Value = (MemoryAttribute<'static>, &'static TopologyObject)> {
+        memory_attribute().prop_flat_map(|attr| {
+            let targets = attr.targets(None).unwrap().0;
+            let target = if targets.is_empty() {
+                any_object().boxed()
+            } else {
+                prop_oneof![
+                    2 => prop::sample::select(targets),
+                    3 => any_object(),
+                ]
+                .boxed()
+            };
+            (Just(attr), target)
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn initiator_query_errors(
+            (attr, target) in memory_attribute_and_target()
+        ) {
+            let no_initiators = !attr.flags().contains(MemoryAttributeFlags::NEED_INITIATOR);
+            let foreign_target = !attr.topology.contains(target);
+            let check_normalized_error = |res_wo_ok: Result<(), InitiatorQueryError>| {
+                match res_wo_ok {
+                    Ok(()) => prop_assert!(!(no_initiators || foreign_target)),
+                    Err(InitiatorQueryError::ForeignTarget(_)) => prop_assert!(foreign_target),
+                    Err(InitiatorQueryError::NoInitiators(_)) => prop_assert!(no_initiators),
+                }
+                Ok(())
+            };
+            check_normalized_error(attr.best_initiator(target).map(std::mem::drop))?;
+            check_normalized_error(attr.initiators(target).map(std::mem::drop).map_err(|e| {
+                let HybridError::Rust(e) = e else {
+                    unreachable!("No known error cases that aren't handled on the Rust side, yet got {e:?}")
+                };
+                e
+            }))?;
+        }
+    }
+
+    /// Owned version of [`MemoryAttributeLocation`] for testing
+    #[derive(Clone, Debug)]
+    enum OwnedAttributeLocation {
+        CpuSet(CpuSet),
+        Object(&'static TopologyObject),
+    }
+    //
+    fn borrow_owned_initiator(
+        initiator: &Option<OwnedAttributeLocation>,
+    ) -> Option<MemoryAttributeLocation<'_>> {
+        match initiator {
+            Some(OwnedAttributeLocation::CpuSet(set)) => Some(MemoryAttributeLocation::from(set)),
+            Some(OwnedAttributeLocation::Object(obj)) => Some(MemoryAttributeLocation::from(*obj)),
+            None => None,
+        }
+    }
+
+    /// Pick a memory attribute initiator that has a low odd of being valid
+    fn any_initiator() -> impl Strategy<Value = Option<OwnedAttributeLocation>> {
+        prop_oneof![
+            topology_related_set(Topology::cpuset)
+                .prop_map(|set| Some(OwnedAttributeLocation::CpuSet(set))),
+            any_object().prop_map(|obj| Some(OwnedAttributeLocation::Object(obj)))
+        ]
+    }
+
+    /// Pick an (attribute, target, initiator) triple where (target, initiator)
+    /// has a chance of being correct for this attribute, but may be a random
+    /// object/cpuset possibly coming from another topology.
+    fn memory_attribute_target_initiator() -> impl Strategy<
+        Value = (
+            MemoryAttribute<'static>,
+            &'static TopologyObject,
+            Option<OwnedAttributeLocation>,
+        ),
+    > {
+        memory_attribute_and_target().prop_flat_map(move |(attr, target)| {
+            let initiator = if attr.flags().contains(MemoryAttributeFlags::NEED_INITIATOR) {
+                let (actual_initiators, _values) = attr.initiators(target).unwrap_or_default();
+                if actual_initiators.is_empty() {
+                    prop_oneof![
+                        1 => Just(None),
+                        4 => any_initiator(),
+                    ]
+                    .boxed()
+                } else {
+                    let actual_initiator = prop::sample::select(actual_initiators.clone());
+                    prop_oneof![
+                        1 => Just(None),
+                        2 => actual_initiator.prop_flat_map(move |actual_initiator| {
+                            match actual_initiator {
+                                MemoryAttributeLocation::CpuSet(set) => {
+                                    set_with_reference(set)
+                                        .prop_map(|set| Some(OwnedAttributeLocation::CpuSet(set)))
+                                        .boxed()
+                                }
+                                MemoryAttributeLocation::Object(obj) => {
+                                    Just(Some(OwnedAttributeLocation::Object(obj)))
+                                        .boxed()
+                                }
+                            }
+                        }),
+                        2 => any_initiator(),
+                    ]
+                    .boxed()
+                }
+            } else {
+                prop_oneof![
+                    2 => Just(None),
+                    3 => any_initiator(),
+                ]
+                .boxed()
+            };
+            (Just(attr), Just(target), initiator)
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn value_query_errors(
+            (attr, target, initiator) in memory_attribute_target_initiator()
+        ) {
+            // Avoid invalid value() calls which are not caught by hwloc's error
+            // handling, resulting in segfaults until
+            // https://github.com/open-mpi/hwloc/issues/685 is resolved.
+            if attr.name() == c"Locality" && target.cpuset().is_none() {
+                return Ok(());
+            }
+
+            // Detect errors which are handled on the Rust side
+            let foreign_initiator = matches!(initiator,
+                Some(OwnedAttributeLocation::Object(obj)) if !attr.topology.contains(obj)
+            );
+            let foreign_target = !attr.topology.contains(target);
+            let attr_needs_initiator = attr.flags().contains(MemoryAttributeFlags::NEED_INITIATOR);
+            let need_initiator = attr_needs_initiator && initiator.is_none();
+            let unwanted_initiator = !attr_needs_initiator && initiator.is_some();
+            let any_error = foreign_initiator || foreign_target || need_initiator || unwanted_initiator;
+
+            // Detect invalid (target, initiator) pairs.
+            let (valid_targets, _values) = attr.targets(None).unwrap();
+            let invalid_initiator_or_target = (attr_needs_initiator != initiator.is_some()) || valid_targets.iter().all(|candidate| {
+                if candidate.global_persistent_index() != target.global_persistent_index() {
+                    return true;
+                }
+                if !attr_needs_initiator {
+                    return false;
+                }
+                let (initiators, _values) = attr.initiators(candidate).unwrap();
+                initiators.iter().all(|candidate| match (candidate, &initiator) {
+                    (MemoryAttributeLocation::CpuSet(candidate), Some(OwnedAttributeLocation::CpuSet(set))) => {
+                        !candidate.includes(set)
+                    }
+                    (MemoryAttributeLocation::Object(candidate), Some(OwnedAttributeLocation::Object(obj))) => {
+                        candidate.global_persistent_index() != obj.global_persistent_index()
+                    },
+                    _ => true,
+                })
+            });
+
+            // Call value query and check result
+            match attr.value(borrow_owned_initiator(&initiator), target) {
+                Ok(value) => {
+                    prop_assert!(!any_error);
+                    // NOTE: Right now we're only testing this direction because
+                    //       hwloc can yield attribute values for invalid
+                    //       (initiator, target) pairs.
+                    if value.is_none() {
+                        prop_assert!(invalid_initiator_or_target);
+                    }
+                }
+                Err(HybridError::Rust(er)) => match er {
+                    ValueQueryError::BadInitiator(ei) => match ei {
+                        InitiatorInputError::ForeignInitiator(_) => {
+                            prop_assert!(foreign_initiator);
+                            prop_assert!(matches!(
+                                initiator,
+                                Some(OwnedAttributeLocation::Object(obj))
+                                if ei == InitiatorInputError::from(obj)
+                            ));
+                        }
+                        InitiatorInputError::NeedInitiator(_) => prop_assert!(need_initiator),
+                        InitiatorInputError::UnwantedInitiator(_) => prop_assert!(unwanted_initiator),
+                    },
+                    ValueQueryError::ForeignTarget(_) => prop_assert!(foreign_target),
+                },
+                Err(HybridError::Hwloc(e)) => unreachable!("Unexpected hwloc error {e}"),
+            };
+        }
+    }
+
+    /// Given a memory attribute, pick an initiator that has a chance of being
+    /// correct for this attribute, but may be a random object possibly coming
+    /// from another topology.
+    fn memory_attribute_and_initiator(
+    ) -> impl Strategy<Value = (MemoryAttribute<'static>, Option<OwnedAttributeLocation>)> {
+        memory_attribute_target_initiator().prop_map(|(attr, _target, initiator)| (attr, initiator))
+    }
+
+    proptest! {
+        #[test]
+        fn target_query_errors(
+            (attr, initiator) in memory_attribute_and_initiator()
+        ) {
+            let foreign_initiator = matches!(initiator,
+                Some(OwnedAttributeLocation::Object(obj)) if !attr.topology.contains(obj)
+            );
+            let attr_needs_initiator = attr.flags().contains(MemoryAttributeFlags::NEED_INITIATOR);
+            let need_initiator = attr_needs_initiator && initiator.is_none();
+            let unwanted_initiator = !attr_needs_initiator && initiator.is_some();
+
+            let check_normalized_error = |res_wo_ok: Result<(), InitiatorInputError>,
+                                          initiator_is_optional: bool| {
+                match res_wo_ok {
+                    Ok(()) => prop_assert!(
+                        !(foreign_initiator || unwanted_initiator)
+                        && (initiator_is_optional || !need_initiator)
+                    ),
+                    Err(InitiatorInputError::ForeignInitiator(_)) => prop_assert!(foreign_initiator),
+                    Err(InitiatorInputError::NeedInitiator(_)) => prop_assert!(
+                        need_initiator && !initiator_is_optional
+                    ),
+                    Err(InitiatorInputError::UnwantedInitiator(_)) => prop_assert!(unwanted_initiator),
+                }
+                Ok(())
+            };
+
+            let initiator = borrow_owned_initiator(&initiator);
+            check_normalized_error(
+                attr.best_target(initiator).map(std::mem::drop),
+                false,
+            )?;
+            check_normalized_error(
+                attr.targets(initiator).map(std::mem::drop).map_err(|e| {
+                    let HybridError::Rust(e) = e else {
+                        unreachable!("No known error cases that aren't handled on the Rust side, yet got {e:?}")
+                    };
+                    e
+                }),
+                true,
+            )?;
         }
     }
 
