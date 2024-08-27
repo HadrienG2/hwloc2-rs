@@ -142,7 +142,7 @@ impl Topology {
         }
     }
 
-    /// Find local NUMA nodes
+    /// Find NUMA nodes that are local to some CPUs or [`TopologyObject`].
     ///
     /// If `target` is given as a [`TopologyObject`], its CPU set is used to
     /// find NUMA nodes with the corresponding locality. If the object does not
@@ -165,12 +165,12 @@ impl Topology {
     #[doc(alias = "hwloc_get_local_numanode_objs")]
     pub fn local_numa_nodes<'target>(
         &self,
-        target: impl Into<TargetNumaNodes<'target>>,
+        target: impl Into<NUMALocation<'target>>,
     ) -> Result<Vec<&TopologyObject>, HybridError<ForeignObjectError>> {
         /// Polymorphized version of this function (avoids generics code bloat)
         fn polymorphized<'self_>(
             self_: &'self_ Topology,
-            target: TargetNumaNodes<'_>,
+            target: NUMALocation<'_>,
         ) -> Result<Vec<&'self_ TopologyObject>, HybridError<ForeignObjectError>> {
             // Prepare to call hwloc
             // SAFETY: Will only be used before returning from this function
@@ -179,7 +179,7 @@ impl Topology {
             let call_ffi = |nr_mut, out_ptr| {
                 // SAFETY: - Topology is trusted to contain a valid ptr (type invariant)
                 //         - hwloc ops are trusted not to modify *const parameters
-                //         - The TargetNumaNodes API is designed in such a way that
+                //         - The NUMALocation API is designed in such a way that
                 //           an invalid (location, flags) tuple cannot happen.
                 //         - nr_mut and out_ptr are call site dependent, see below.
                 errors::call_hwloc_int_normal("hwloc_get_local_numanode_objs", || unsafe {
@@ -1871,7 +1871,7 @@ bitflags! {
         /// The initiator is ignored.
         ///
         /// This flag is automatically set when users specify
-        /// [`TargetNumaNodes::All`] as the target NUMA node set.
+        /// [`NUMALocation::All`] as the target NUMA node set.
         #[doc(hidden)]
         const ALL = HWLOC_LOCAL_NUMANODE_FLAG_ALL;
     }
@@ -1879,9 +1879,9 @@ bitflags! {
 //
 crate::impl_arbitrary_for_bitflags!(LocalNUMANodeFlags, hwloc_local_numanode_flag_e);
 
-/// Target NUMA nodes
+/// Scope of a [`Topology::local_numa_nodes()`] query
 #[derive(Copy, Clone, Debug)]
-pub enum TargetNumaNodes<'target> {
+pub enum NUMALocation<'target> {
     /// Nodes local to some object
     Local {
         /// Initiator which NUMA nodes should be local to
@@ -1900,7 +1900,7 @@ pub enum TargetNumaNodes<'target> {
     All,
 }
 //
-impl TargetNumaNodes<'_> {
+impl NUMALocation<'_> {
     /// Convert to the inputs expected by a `hwloc_get_local_numanode_objs`
     /// query against `topology`
     ///
@@ -1932,7 +1932,7 @@ impl TargetNumaNodes<'_> {
     }
 }
 //
-impl<'target, T: Into<MemoryAttributeLocation<'target>>> From<T> for TargetNumaNodes<'target> {
+impl<'target, T: Into<MemoryAttributeLocation<'target>>> From<T> for NUMALocation<'target> {
     fn from(location: T) -> Self {
         Self::Local {
             location: location.into(),
@@ -2492,6 +2492,107 @@ mod tests {
                 }),
                 true,
             )?;
+        }
+    }
+
+    /// Owned version of [`NUMALocation`]
+    #[derive(Clone, Debug)]
+    enum OwnedNUMALocation {
+        Local {
+            location: OwnedAttributeLocation,
+            flags: LocalNUMANodeFlags,
+        },
+        All,
+    }
+
+    /// Generate an `OwnedNUMALocation`
+    fn numa_location() -> impl Strategy<Value = OwnedNUMALocation> {
+        let topology = Topology::test_instance();
+        prop_oneof![
+            1 => Just(OwnedNUMALocation::All),
+            2 => {
+                (any_object(), any::<LocalNUMANodeFlags>()).prop_map(|(obj, flags)| {
+                    OwnedNUMALocation::Local {
+                        location: OwnedAttributeLocation::Object(obj),
+                        flags,
+                    }
+                })
+            },
+            2 => {
+                let numa_nodes = topology.objects_with_type(ObjectType::NUMANode).filter(|numa| {
+                    numa.cpuset().unwrap().weight().unwrap() > 0
+                }).collect::<Vec<_>>();
+                prop::sample::select(numa_nodes).prop_flat_map(|numa| {
+                    (set_with_reference(numa.cpuset().unwrap()), any::<LocalNUMANodeFlags>()).prop_map(|(set, flags)| {
+                        OwnedNUMALocation::Local {
+                            location: OwnedAttributeLocation::CpuSet(set),
+                            flags,
+                        }
+                    })
+                })
+            }
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn local_numa_nodes(location in numa_location()) {
+            let topology = Topology::test_instance();
+            let location = match &location {
+                OwnedNUMALocation::Local { location, flags } => {
+                    let location = match location {
+                        OwnedAttributeLocation::Object(obj) => MemoryAttributeLocation::from(*obj),
+                        OwnedAttributeLocation::CpuSet(set) => MemoryAttributeLocation::from(set),
+                    };
+                    NUMALocation::Local { location, flags: *flags }
+                }
+                OwnedNUMALocation::All => NUMALocation::All,
+            };
+            let res = topology.local_numa_nodes(location);
+
+            let foreign_object = if let NUMALocation::Local { location: MemoryAttributeLocation::Object(obj), .. } = location {
+                !topology.contains(obj)
+            } else {
+                false
+            };
+            prop_assert_eq!(res.is_err(), foreign_object);
+            let Ok(nodes) = res else { return Ok(()); };
+            let node_ids = nodes.into_iter()
+                                .map(TopologyObject::global_persistent_index)
+                                .collect::<HashSet<_>>();
+
+            match location {
+                NUMALocation::All => {
+                    let all_node_ids = topology.objects_with_type(ObjectType::NUMANode)
+                                               .map(TopologyObject::global_persistent_index)
+                                               .collect::<HashSet<_>>();
+                    prop_assert_eq!(node_ids, all_node_ids);
+                }
+                NUMALocation::Local { location, flags } => {
+                    let cpuset = match location {
+                        MemoryAttributeLocation::CpuSet(set) => set,
+                        MemoryAttributeLocation::Object(obj) => {
+                            obj.cpuset()
+                               .unwrap_or_else(|| obj.first_non_io_ancestor()
+                                                     .unwrap()
+                                                     .cpuset()
+                                                     .unwrap())
+                        }
+                    };
+                    let expected_node_ids = topology
+                        .objects_with_type(ObjectType::NUMANode)
+                        .filter_map(|node| {
+                            let node_cpuset = node.cpuset().unwrap();
+                            let flags = flags - LocalNUMANodeFlags::ALL;
+                            let is_match = (flags == LocalNUMANodeFlags::empty() && node_cpuset == cpuset)
+                                || (flags.contains(LocalNUMANodeFlags::LARGER_LOCALITY) && node_cpuset.includes(cpuset))
+                                || (flags.contains(LocalNUMANodeFlags::SMALLER_LOCALITY) && cpuset.includes(node_cpuset));
+                            is_match.then(|| node.global_persistent_index())
+                        })
+                        .collect::<HashSet<_>>();
+                    prop_assert_eq!(expected_node_ids, node_ids);
+                }
+            }
         }
     }
 
