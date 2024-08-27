@@ -24,7 +24,7 @@ use crate::{
         string::LibcString,
         transparent::{AsInner, AsNewtype},
     },
-    object::{types::ObjectType, TopologyObject},
+    object::TopologyObject,
     topology::{editor::TopologyEditor, Topology},
 };
 use bitflags::bitflags;
@@ -229,7 +229,7 @@ impl Topology {
     }
 }
 
-/// Dumb of memory attributes, for now only usable via its Debug implementation
+/// Dump of memory attributes, used to implement topology Debug and comparison
 #[derive(Clone)]
 pub(crate) struct MultiAttributeDump<'topology>(Vec<AttributeDump<'topology>>);
 //
@@ -239,7 +239,7 @@ impl<'topology> MultiAttributeDump<'topology> {
         Self(
             MemoryAttribute::BUILTIN_ATTRIBUTES
                 .into_iter()
-                .map(|constructor| AttributeDump::for_each_numa(constructor(topology)))
+                .map(|constructor| AttributeDump::for_each_target(constructor(topology)))
                 .collect(),
         )
     }
@@ -269,36 +269,126 @@ impl Debug for MultiAttributeDump<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut attr_to_dump = f.debug_map();
         for attr_dump in &self.0 {
-            attr_to_dump.entry(&attr_dump.attribute, &format_args!("{attr_dump:#?}"));
+            attr_to_dump.entry(&attr_dump.attribute, &attr_dump.targets);
         }
         attr_to_dump.finish()
     }
 }
 
 /// Dump of a specific memory attribute
-//
-// --- Implementation notes ---
-//
-// Before making this pub, find a cleaner way to implement fmt_value
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct AttributeDump<'topology> {
     /// Attribute being dumped
     attribute: MemoryAttribute<'topology>,
 
-    /// Attribute dump for each NUMA node on the system
-    numa_nodes: Vec<NodeAttributeDump<'topology>>,
+    /// Data dump for each known attribute target
+    targets: Result<AttributeDumpTargets<'topology>, HybridError<InitiatorInputError>>,
 }
 //
 impl<'topology> AttributeDump<'topology> {
-    /// Dump the value of the attribute for each NUMA node on the system
-    fn for_each_numa(attribute: MemoryAttribute<'topology>) -> Self {
+    /// Dump the value of the attribute for each target on the system
+    fn for_each_target(attribute: MemoryAttribute<'topology>) -> Self {
         Self {
             attribute,
-            numa_nodes: attribute
-                .topology
-                .objects_with_type(ObjectType::NUMANode)
-                .map(|node| NodeAttributeDump::new(attribute, node))
-                .collect(),
+            targets: AttributeDumpTargets::new(attribute),
+        }
+    }
+
+    /// Truth that this dump contains the same data as another dump, assuming
+    /// both dumps originate from related topologies.
+    ///
+    /// By related, we mean that `other` should either originate from the same
+    /// [`Topology`] as `self`, or from a (possibly modified) clone of that
+    /// topology, which allows us to use object global persistent indices as
+    /// object identifiers.
+    ///
+    /// Comparing dumps from unrelated topologies will yield an unpredictable
+    /// boolean value.
+    fn eq_modulo_topology(&self, other: &Self) -> bool {
+        if self.attribute.id != other.attribute.id {
+            return false;
+        }
+        match (&self.targets, &other.targets) {
+            (Ok(ok1), Ok(ok2)) => ok1.eq_modulo_topology(ok2),
+            (Err(err1), Err(err2)) => err1 == err2,
+            (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
+        }
+    }
+}
+
+/// `targets` field of `AttributeDump`
+///
+/// Needs to be its own struct due to design limitations of the
+/// `Debug`/`Formatter` machinery.
+#[derive(Clone)]
+struct AttributeDumpTargets<'topology>(Vec<TargetAttributeDump<'topology>>);
+//
+impl<'topology> AttributeDumpTargets<'topology> {
+    /// Dump the value of the attribute for each target on the system
+    fn new(
+        attribute: MemoryAttribute<'topology>,
+    ) -> Result<Self, HybridError<InitiatorInputError>> {
+        attribute.targets(None).map(|(targets, _values)| {
+            Self(
+                targets
+                    .into_iter()
+                    .map(|target| TargetAttributeDump::new(attribute, target))
+                    .collect(),
+            )
+        })
+    }
+
+    /// Truth that this dump contains the same data as another dump, assuming
+    /// both dumps originate from related topologies.
+    ///
+    /// By related, we mean that `other` should either originate from the same
+    /// [`Topology`] as `self`, or from a (possibly modified) clone of that
+    /// topology, which allows us to use object global persistent indices as
+    /// object identifiers.
+    ///
+    /// Comparing dumps from unrelated topologies will yield an unpredictable
+    /// boolean value.
+    fn eq_modulo_topology(&self, other: &Self) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0
+            .iter()
+            .zip(&other.0)
+            .all(|(dump1, dump2)| dump1.eq_modulo_topology(dump2))
+    }
+}
+//
+impl Debug for AttributeDumpTargets<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut targets_to_initiators = f.debug_map();
+        for target_dump in &self.0 {
+            targets_to_initiators.entry(&target_dump.target, &target_dump.initiators_and_values);
+        }
+        targets_to_initiators.finish()
+    }
+}
+
+/// Dump of a specific memory attribute for a specific target
+#[derive(Clone, Debug)]
+struct TargetAttributeDump<'topology> {
+    /// Target for which the memory attribute values were queried
+    target: &'topology TopologyObject,
+
+    /// Result of the memory attribute value query
+    initiators_and_values: Result<InitiatorsAndValues<'topology>, RawHwlocError>,
+}
+//
+impl<'topology> TargetAttributeDump<'topology> {
+    /// Dump the value of the attribute for a specific target
+    ///
+    /// # Panics
+    ///
+    /// Expects `target` to belong to the same topology as `attribute`.
+    fn new(attribute: MemoryAttribute<'topology>, target: &'topology TopologyObject) -> Self {
+        Self {
+            target,
+            initiators_and_values: InitiatorsAndValues::new(attribute, target),
         }
     }
 
@@ -313,94 +403,71 @@ impl<'topology> AttributeDump<'topology> {
     /// Comparing dumps from unrelated topologies will yield an unpredictable
     /// boolean value.
     pub(crate) fn eq_modulo_topology(&self, other: &Self) -> bool {
-        if self.attribute.id != other.attribute.id {
+        if self.target.global_persistent_index() != other.target.global_persistent_index() {
             return false;
         }
-        if self.numa_nodes.len() != other.numa_nodes.len() {
-            return false;
-        }
-        self.numa_nodes
-            .iter()
-            .zip(&other.numa_nodes)
-            .all(|(dump1, dump2)| dump1.eq_modulo_topology(dump2))
-    }
-
-    /// Format the `numa_nodes` field
-    fn fmt_value(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        let mut node_to_initiators = f.debug_map();
-        for node in &self.numa_nodes {
-            node_to_initiators.entry(&format_args!("{}", node.numa), &format_args!("{node:#?}"));
-        }
-        node_to_initiators.finish()
-    }
-}
-//
-impl Debug for AttributeDump<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Dreadful hack to get a Formatter, thankfully this struct isn't pub
-        #[allow(clippy::recursive_format_impl)]
-        if f.alternate() {
-            self.fmt_value(f)
-        } else {
-            f.debug_struct("AttributeDump")
-                .field("attribute", &self.attribute)
-                .field("numa_nodes", &format_args!("{self:#?}"))
-                .finish()
+        match (&self.initiators_and_values, &other.initiators_and_values) {
+            (Ok(ok1), Ok(ok2)) => ok1.eq_modulo_topology(ok2),
+            (Err(err1), Err(err2)) => err1 == err2,
+            (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
         }
     }
 }
 
-/// Dump of a specific memory attribute for a specific NUMA node
-//
-// --- Implementation notes ---
-//
-// Before making this pub, find a cleaner way to implement fmt_value
+/// `initiators_and_values` field of `TargetAttributeDump`
+///
+/// Needs to be its own struct due to design limitations of the
+/// `Debug`/`Formatter` machinery.
 #[derive(Clone)]
-struct NodeAttributeDump<'topology> {
-    /// NUMA node for which the memory attribute values were queried
-    numa: &'topology TopologyObject,
+struct InitiatorsAndValues<'topology> {
+    /// Initiators for which attribute values were recorded, if any
+    initiators: Option<Vec<MemoryAttributeLocation<'topology>>>,
 
-    /// Result of the memory attribute value query
-    initiators_and_values:
-        Result<(Option<Vec<MemoryAttributeLocation<'topology>>>, Vec<u64>), RawHwlocError>,
+    /// Recorded attribute value (only 1 if no initiator)
+    values: Vec<u64>,
 }
 //
-impl<'topology> NodeAttributeDump<'topology> {
-    /// Dump the value of the attribute for a specific NUMA node
+impl<'topology> InitiatorsAndValues<'topology> {
+    /// Dump the value of the attribute for a specific target
     ///
     /// # Panics
     ///
-    /// Expects `numa` to belong to the same topology as `attribute`.
-    fn new(attribute: MemoryAttribute<'topology>, numa: &'topology TopologyObject) -> Self {
-        let initiators_and_values = if attribute
+    /// Expects `target` to belong to the same topology as `attribute`.
+    fn new(
+        attribute: MemoryAttribute<'topology>,
+        target: &'topology TopologyObject,
+    ) -> Result<Self, RawHwlocError> {
+        if attribute
             .flags()
             .contains(MemoryAttributeFlags::NEED_INITIATOR)
         {
             attribute
-                .initiators(numa)
-                .map(|(initiators, values)| (Some(initiators), values))
+                .initiators(target)
+                .map(|(initiators, values)| Self {
+                    initiators: Some(initiators),
+                    values,
+                })
                 .map_err(|e| {
                     e.expect_only_hwloc(
                         "shouldn't happen because this attribute \
-                        does have initiators and the target NUMA \
-                        node does belong to the topology",
+                        does have initiators and the target \
+                        TopologyObject does belong to the topology",
                     )
                 })
         } else {
             attribute
-                .value(None, numa)
-                .map(|value| (None, value.map_or_else(Vec::new, |value| vec![value])))
+                .value(None, target)
+                .map(|value| Self {
+                    initiators: None,
+                    values: value.map_or_else(Vec::new, |value| vec![value]),
+                })
                 .map_err(|e| {
                     e.expect_only_hwloc(
                         "shouldn't happen because this attribute \
-                        has no initiators and the target NUMA \
-                        node does belong to the topology",
+                        has no initiators and the target \
+                        TopologyObject does belong to the topology",
                     )
                 })
-        };
-        Self {
-            numa,
-            initiators_and_values,
         }
     }
 
@@ -415,19 +482,10 @@ impl<'topology> NodeAttributeDump<'topology> {
     /// Comparing dumps from unrelated topologies will yield an unpredictable
     /// boolean value.
     pub(crate) fn eq_modulo_topology(&self, other: &Self) -> bool {
-        if self.numa.global_persistent_index() != other.numa.global_persistent_index() {
+        if self.values != other.values {
             return false;
         }
-        let (ok1, ok2) = match (&self.initiators_and_values, &other.initiators_and_values) {
-            (Ok(ok1), Ok(ok2)) => (ok1, ok2),
-            (Err(err1), Err(err2)) => return err1 == err2,
-            (Ok(_), Err(_)) | (Err(_), Ok(_)) => return false,
-        };
-        let ((initiators1, values1), (initiators2, values2)) = (ok1, ok2);
-        if values1 != values2 {
-            return false;
-        }
-        let (initiators1, initiators2) = match (initiators1, initiators2) {
+        let (initiators1, initiators2) = match (&self.initiators, &other.initiators) {
             (Some(i1), Some(i2)) => (i1, i2),
             (None, None) => return true,
             (Some(_), None) | (None, Some(_)) => return false,
@@ -446,52 +504,26 @@ impl<'topology> NodeAttributeDump<'topology> {
             }
         })
     }
-
-    /// Format the `initiators_and_values` field
-    fn fmt_value(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        // Handle query errors
-        let (initiators, values) = match &self.initiators_and_values {
-            Ok(o) => o,
-            Err(e) => {
-                let mut err = f.debug_tuple("Err");
-                if let Some(errno) = &e.errno {
-                    err.field(&errno);
-                }
-                return err.finish();
-            }
-        };
-
+}
+//
+impl Debug for InitiatorsAndValues<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Handle initiator-less attributes
-        let Some(initiators) = initiators else {
+        let Some(initiators) = &self.initiators else {
             assert_eq!(
-                values.len(),
+                self.values.len(),
                 1,
                 "memory attributes without an initiator should have only one value"
             );
-            return write!(f, "{}", values[0]);
+            return write!(f, "{}", self.values[0]);
         };
 
         // Handle initiator-ful attributes
         let mut initiator_to_value = f.debug_map();
-        for (initiator, value) in initiators.iter().zip(values) {
+        for (initiator, value) in initiators.iter().zip(&self.values) {
             initiator_to_value.entry(&initiator, &value);
         }
         initiator_to_value.finish()
-    }
-}
-//
-impl Debug for NodeAttributeDump<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Dreadful hack to get a Formatter, thankfully this struct isn't pub
-        #[allow(clippy::recursive_format_impl)]
-        if f.alternate() {
-            self.fmt_value(f)
-        } else {
-            f.debug_struct("NodeAttributeDump")
-                .field("numa", self.numa)
-                .field("initiators_and_values", &format_args!("{self:#?}"))
-                .finish()
-        }
     }
 }
 
@@ -1997,7 +2029,7 @@ crate::impl_arbitrary_for_bitflags!(MemoryAttributeFlags, hwloc_memattr_flag_e);
 mod tests {
     use super::*;
     use crate::{
-        object::TopologyObjectID,
+        object::{types::ObjectType, TopologyObjectID},
         strategies::{any_object, any_string, set_with_reference, topology_related_set},
     };
     use proptest::prelude::*;
