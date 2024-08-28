@@ -2447,7 +2447,7 @@ mod tests {
             }
 
             // Make sure the object name doesn't contain NUL chars
-            if name.chars().any(|c| c == '\0') {
+            if name.contains('\0') {
                 prop_assert_eq!(res.unwrap_err(), HybridError::Rust(NulError.into()));
                 assert_eq!(topology, initial_topology);
                 return Ok(());

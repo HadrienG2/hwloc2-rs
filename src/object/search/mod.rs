@@ -938,7 +938,7 @@ mod tests {
 
             // NUL in input strings should be reported as an error
             for s in subtype.as_ref().into_iter().chain(name_prefix.as_ref()) {
-                if s.chars().any(|c| c == '\0') {
+                if s.contains('\0') {
                     prop_assert!(
                         matches!(result, Err(e) if e == &LocalObjectError::from(NulError))
                     );

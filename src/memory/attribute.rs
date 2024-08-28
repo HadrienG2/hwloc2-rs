@@ -2253,7 +2253,7 @@ mod tests {
             let topology = Topology::test_instance();
             let res = topology.memory_attribute_named(&name);
 
-            let name_contains_nul = name.chars().any(|c| c == '\0');
+            let name_contains_nul = name.contains('\0');
             let Ok(maybe_attr) = res else {
                 prop_assert!(name_contains_nul);
                 return Ok(());
