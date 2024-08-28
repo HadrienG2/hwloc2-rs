@@ -2039,6 +2039,7 @@ mod tests {
         cmp::Ordering,
         collections::{HashMap, HashSet},
         ffi::CString,
+        sync::OnceLock,
     };
 
     /// Mechanism to track the best value of a memory attribute and the
@@ -2628,5 +2629,83 @@ mod tests {
         }
     }
 
-    // TODO: Test other memattr functionality
+    fn builtin_attr_names() -> &'static [String] {
+        static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+        NAMES
+            .get_or_init(|| {
+                let topology = Topology::test_instance();
+                MemoryAttribute::BUILTIN_ATTRIBUTES
+                    .iter()
+                    .map(|attr| attr(topology).name().to_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .as_slice()
+    }
+
+    // New memory attribute name with a fair chance of collision
+    fn attribute_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            2 => prop::sample::select(builtin_attr_names()),
+            3 => any_string(),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn build_empty_attribute(
+            name in attribute_name(),
+            flags: MemoryAttributeFlags
+        ) {
+            let initial_topology = Topology::test_instance();
+            let mut topology = initial_topology.clone();
+            let res = topology.edit(|editor| {
+                editor
+                    .register_memory_attribute(&name, flags)
+                    .map(std::mem::drop)
+            });
+
+            let bad_flags =
+                (flags & (MemoryAttributeFlags::HIGHER_IS_BEST
+                          | MemoryAttributeFlags::LOWER_IS_BEST))
+                    .iter()
+                    .count() != 1;
+            let name_contains_nul = name.contains('\0');
+            let expected_name_taken = builtin_attr_names().contains(&name);
+            match res {
+                Ok(()) => prop_assert!(!(bad_flags || name_contains_nul || expected_name_taken)),
+                Err(e) => {
+                    match e {
+                        RegisterError::BadFlags(bf) => {
+                            prop_assert!(bad_flags, "Got unexpected BadFlags error with flags {flags:?}");
+                            prop_assert_eq!(bf, FlagsError::from(flags));
+                        }
+                        RegisterError::NameContainsNul => prop_assert!(name_contains_nul),
+                        RegisterError::NameTaken(taken) => {
+                            prop_assert_eq!(&*name, &*taken);
+                            // NOT testing expected_name_taken: there might be
+                            // other attribute names around we don't know about.
+                        }
+                    }
+                    prop_assert_eq!(&topology, initial_topology);
+                    return Ok(());
+                }
+            }
+
+            // FIXME: Since hwloc does not support listing memory attributes,
+            // topology PartialEq must ignore the new attribute for now
+            prop_assert_eq!(&topology, initial_topology);
+
+            let attr = topology.memory_attribute_named(&name).unwrap().unwrap();
+            let cname = CString::new(name).unwrap();
+            prop_assert_eq!(attr.name(), cname.as_c_str());
+            prop_assert_eq!(attr.flags(), flags);
+            let (targets, values) = attr.targets(None).unwrap();
+            prop_assert!(targets.is_empty());
+            prop_assert_eq!(values, None);
+        }
+    }
+
+    // TODO: Build attribute with contents, test attribute dumps and their Debug
+
+    // TODO: Check coverage and see if I need any other test
 }
