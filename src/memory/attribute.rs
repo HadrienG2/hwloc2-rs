@@ -223,9 +223,9 @@ impl Topology {
         polymorphized(self, target.into())
     }
 
-    /// Dump the values of all built-in memory attributes
-    pub(crate) fn dump_builtin_attributes(&self) -> MultiAttributeDump<'_> {
-        MultiAttributeDump::builtins(self)
+    /// Dump the values of all memory attributes
+    pub(crate) fn dump_memory_attributes(&self) -> MultiAttributeDump<'_> {
+        MultiAttributeDump::new(self)
     }
 }
 
@@ -234,12 +234,11 @@ impl Topology {
 pub(crate) struct MultiAttributeDump<'topology>(Vec<AttributeDump<'topology>>);
 //
 impl<'topology> MultiAttributeDump<'topology> {
-    /// Dump all built-in memory attributes
-    fn builtins(topology: &'topology Topology) -> Self {
+    /// Dump all memory attributes
+    fn new(topology: &'topology Topology) -> Self {
         Self(
-            MemoryAttribute::BUILTIN_ATTRIBUTES
-                .into_iter()
-                .map(|constructor| AttributeDump::for_each_target(constructor(topology)))
+            MemoryAttribute::all(topology)
+                .map(AttributeDump::new)
                 .collect(),
         )
     }
@@ -282,12 +281,12 @@ struct AttributeDump<'topology> {
     attribute: MemoryAttribute<'topology>,
 
     /// Data dump for each known attribute target
-    targets: Result<AttributeDumpTargets<'topology>, HybridError<InitiatorInputError>>,
+    targets: AttributeDumpTargets<'topology>,
 }
 //
 impl<'topology> AttributeDump<'topology> {
-    /// Dump the value of the attribute for each target on the system
-    fn for_each_target(attribute: MemoryAttribute<'topology>) -> Self {
+    /// Dump the value of the attribute for each registered target
+    fn new(attribute: MemoryAttribute<'topology>) -> Self {
         Self {
             attribute,
             targets: AttributeDumpTargets::new(attribute),
@@ -308,11 +307,7 @@ impl<'topology> AttributeDump<'topology> {
         if self.attribute.id != other.attribute.id {
             return false;
         }
-        match (&self.targets, &other.targets) {
-            (Ok(ok1), Ok(ok2)) => ok1.eq_modulo_topology(ok2),
-            (Err(err1), Err(err2)) => err1 == err2,
-            (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
-        }
+        self.targets.eq_modulo_topology(&other.targets)
     }
 }
 
@@ -325,17 +320,16 @@ struct AttributeDumpTargets<'topology>(Vec<TargetAttributeDump<'topology>>);
 //
 impl<'topology> AttributeDumpTargets<'topology> {
     /// Dump the value of the attribute for each target on the system
-    fn new(
-        attribute: MemoryAttribute<'topology>,
-    ) -> Result<Self, HybridError<InitiatorInputError>> {
-        attribute.targets(None).map(|(targets, _values)| {
-            Self(
-                targets
-                    .into_iter()
-                    .map(|target| TargetAttributeDump::new(attribute, target))
-                    .collect(),
-            )
-        })
+    fn new(attribute: MemoryAttribute<'topology>) -> Self {
+        let (targets, _values) = attribute
+            .targets(None)
+            .expect("targets() should never panic with a None input");
+        Self(
+            targets
+                .into_iter()
+                .map(|target| TargetAttributeDump::new(attribute, target))
+                .collect(),
+        )
     }
 
     /// Truth that this dump contains the same data as another dump, assuming
@@ -376,7 +370,7 @@ struct TargetAttributeDump<'topology> {
     target: &'topology TopologyObject,
 
     /// Result of the memory attribute value query
-    initiators_and_values: Result<InitiatorsAndValues<'topology>, RawHwlocError>,
+    initiators_and_values: InitiatorsAndValues<'topology>,
 }
 //
 impl<'topology> TargetAttributeDump<'topology> {
@@ -406,11 +400,8 @@ impl<'topology> TargetAttributeDump<'topology> {
         if self.target.global_persistent_index() != other.target.global_persistent_index() {
             return false;
         }
-        match (&self.initiators_and_values, &other.initiators_and_values) {
-            (Ok(ok1), Ok(ok2)) => ok1.eq_modulo_topology(ok2),
-            (Err(err1), Err(err2)) => err1 == err2,
-            (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
-        }
+        self.initiators_and_values
+            .eq_modulo_topology(&other.initiators_and_values)
     }
 }
 
@@ -433,10 +424,7 @@ impl<'topology> InitiatorsAndValues<'topology> {
     /// # Panics
     ///
     /// Expects `target` to belong to the same topology as `attribute`.
-    fn new(
-        attribute: MemoryAttribute<'topology>,
-        target: &'topology TopologyObject,
-    ) -> Result<Self, RawHwlocError> {
+    fn new(attribute: MemoryAttribute<'topology>, target: &'topology TopologyObject) -> Self {
         if attribute
             .flags()
             .contains(MemoryAttributeFlags::NEED_INITIATOR)
@@ -447,13 +435,10 @@ impl<'topology> InitiatorsAndValues<'topology> {
                     initiators: Some(initiators),
                     values,
                 })
-                .map_err(|e| {
-                    e.expect_only_hwloc(
-                        "shouldn't happen because this attribute \
-                        does have initiators and the target \
-                        TopologyObject does belong to the topology",
-                    )
-                })
+                .expect(
+                    "initiator provided when NEED_INITIATOR, \
+                    target is local, no other known error case",
+                )
         } else {
             attribute
                 .value(None, target)
@@ -461,13 +446,10 @@ impl<'topology> InitiatorsAndValues<'topology> {
                     initiators: None,
                     values: value.map_or_else(Vec::new, |value| vec![value]),
                 })
-                .map_err(|e| {
-                    e.expect_only_hwloc(
-                        "shouldn't happen because this attribute \
-                        has no initiators and the target \
-                        TopologyObject does belong to the topology",
-                    )
-                })
+                .expect(
+                    "initiator not provided in absence of NEED_INITIATOR, \
+                    target is local, no other known error case",
+                )
         }
     }
 
@@ -855,23 +837,6 @@ macro_rules! wrap_ids_unchecked {
                 unsafe { Self::wrap(topology, $id) }
             }
         )*
-
-        /// List of all built-in memory attributes
-        #[allow(unused_doc_comments)]
-        pub(crate) const BUILTIN_ATTRIBUTES: [
-            fn(&'topology Topology) -> Self;
-            {[
-                $(
-                    $(#[$attr])*
-                    { stringify!($constructor) }
-                ),*
-            ].len()}
-        ] = [
-            $(
-                $(#[$attr])*
-                { Self::$constructor }
-            ),*
-        ];
     };
 }
 
@@ -947,6 +912,40 @@ impl<'topology> MemoryAttribute<'topology> {
         // TODO: If you add new attributes, add support to static_flags and
         //       a matching MemoryAttribute constructor below
     );
+
+    /// Enumerate all registered memory attributes
+    fn all(topology: &'topology Topology) -> impl Iterator<Item = Self> {
+        (0..).map_while(move |id| {
+            let mut flags = 0;
+            // SAFETY: - Topology is trusted to contain a valid ptr (type invariant)
+            //         - hwloc ops are trusted not to modify *const parameters
+            //         - It has been stated by upstream that probing flags for
+            //           an invalid ID is fine and will just lead to EINVAL
+            //         - flags is an out parameter, its initial value doesn't matter
+            let res = errors::call_hwloc_int_normal("hwloc_memattr_get_flags", || unsafe {
+                hwlocality_sys::hwloc_memattr_get_flags(topology.as_ptr(), id, &mut flags)
+            });
+            match res {
+                Ok(_positive) => Some(
+                    // SAFETY: Checked id validity per upstream suggestion
+                    unsafe { Self::wrap(topology, id) },
+                ),
+                Err(RawHwlocError {
+                    errno: Some(Errno(EINVAL)),
+                    ..
+                }) => None,
+                #[cfg(windows)]
+                Err(RawHwlocError { errno: None, .. }) => {
+                    // As explained in the RawHwlocError documentation, errno values
+                    // may not correctly propagate from hwloc to hwlocality on
+                    // Windows. Since there is only one expected errno value here,
+                    // we'll interpret lack of errno as EINVAL on Windows.
+                    None
+                }
+                Err(raw_err) => unreachable!("Unexpected hwloc error: {raw_err}"),
+            }
+        })
+    }
 }
 //
 /// # Memory attribute API
@@ -2094,18 +2093,16 @@ mod tests {
         }
     }
 
-    /// Test built-in memory attributes for all queries that should succeed
+    /// Test all memory attributes for all queries that should succeed
     #[test]
-    fn builtin_attributes_successes() {
+    fn successful_queries() {
         let topology = Topology::test_instance();
-        for attr in MemoryAttribute::BUILTIN_ATTRIBUTES {
-            let attr = attr(topology);
-
+        for attr in MemoryAttribute::all(topology) {
             let name = attr.name().to_str().unwrap();
             let by_name = topology
                 .memory_attribute_named(name)
-                .expect("Builtin attributes should not have a NUL in their name")
-                .expect("Builtin attributes should be present");
+                .expect("Memory attributes should not have a NUL in their name")
+                .expect("MemoryAttribute::all() should not yield nonexistent attributes");
             assert!(ptr::eq(by_name.topology, attr.topology));
             assert_eq!(by_name.id, attr.id);
 
@@ -2263,19 +2260,16 @@ mod tests {
 
             if maybe_attr.is_none() {
                 let name = CString::new(name).unwrap();
-                for builtin_attr in MemoryAttribute::BUILTIN_ATTRIBUTES {
-                    let builtin_attr = builtin_attr(topology);
-                    prop_assert_ne!(builtin_attr.name(), name.as_c_str());
+                for attr in MemoryAttribute::all(topology) {
+                    prop_assert_ne!(attr.name(), name.as_c_str());
                 }
             }
         }
     }
 
-    /// Pick a memory attribute (only built-in ones supported for now as hwloc
-    /// lacks an entry point to query the list of memory attributes)
+    /// Pick a memory attribute
     fn memory_attribute() -> impl Strategy<Value = MemoryAttribute<'static>> {
-        prop::sample::select(&MemoryAttribute::BUILTIN_ATTRIBUTES[..])
-            .prop_map(|constructor| constructor(Topology::test_instance()))
+        prop::sample::select(MemoryAttribute::all(Topology::test_instance()).collect::<Vec<_>>())
     }
 
     /// Pick a memory attribute and a target that has a chance of being correct
@@ -2629,14 +2623,12 @@ mod tests {
         }
     }
 
-    fn builtin_attr_names() -> &'static [String] {
+    fn attr_names() -> &'static [String] {
         static NAMES: OnceLock<Vec<String>> = OnceLock::new();
         NAMES
             .get_or_init(|| {
-                let topology = Topology::test_instance();
-                MemoryAttribute::BUILTIN_ATTRIBUTES
-                    .iter()
-                    .map(|attr| attr(topology).name().to_str().unwrap().to_owned())
+                MemoryAttribute::all(Topology::test_instance())
+                    .map(|attr| attr.name().to_str().unwrap().to_owned())
                     .collect::<Vec<_>>()
             })
             .as_slice()
@@ -2645,7 +2637,7 @@ mod tests {
     // New memory attribute name with a fair chance of collision
     fn attribute_name() -> impl Strategy<Value = String> {
         prop_oneof![
-            2 => prop::sample::select(builtin_attr_names()),
+            2 => prop::sample::select(attr_names()),
             3 => any_string(),
         ]
     }
@@ -2670,9 +2662,9 @@ mod tests {
                     .iter()
                     .count() != 1;
             let name_contains_nul = name.contains('\0');
-            let expected_name_taken = builtin_attr_names().contains(&name);
+            let name_taken = attr_names().contains(&name);
             match res {
-                Ok(()) => prop_assert!(!(bad_flags || name_contains_nul || expected_name_taken)),
+                Ok(()) => prop_assert!(!(bad_flags || name_contains_nul || name_taken)),
                 Err(e) => {
                     match e {
                         RegisterError::BadFlags(bf) => {
@@ -2681,19 +2673,15 @@ mod tests {
                         }
                         RegisterError::NameContainsNul => prop_assert!(name_contains_nul),
                         RegisterError::NameTaken(taken) => {
+                            prop_assert!(name_taken);
                             prop_assert_eq!(&*name, &*taken);
-                            // NOT testing expected_name_taken: there might be
-                            // other attribute names around we don't know about.
                         }
                     }
                     prop_assert_eq!(&topology, initial_topology);
                     return Ok(());
                 }
             }
-
-            // FIXME: Since hwloc does not support listing memory attributes,
-            // topology PartialEq must ignore the new attribute for now
-            prop_assert_eq!(&topology, initial_topology);
+            prop_assert_ne!(&topology, initial_topology);
 
             let attr = topology.memory_attribute_named(&name).unwrap().unwrap();
             let cname = CString::new(name).unwrap();
@@ -2702,6 +2690,10 @@ mod tests {
             let (targets, values) = attr.targets(None).unwrap();
             prop_assert!(targets.is_empty());
             prop_assert_eq!(values, None);
+
+            let mut expected_dump = initial_topology.dump_memory_attributes();
+            expected_dump.0.push(AttributeDump::new(attr));
+            prop_assert!(topology.dump_memory_attributes().eq_modulo_topology(&expected_dump));
         }
     }
 

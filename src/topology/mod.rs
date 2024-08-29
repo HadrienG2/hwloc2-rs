@@ -998,7 +998,7 @@ impl Debug for Topology {
         // Memory attributes
         #[cfg(feature = "hwloc-2_3_0")]
         {
-            debug.field("builtin_memory_attributes", &self.dump_builtin_attributes());
+            debug.field("memory_attributes", &self.dump_memory_attributes());
         }
 
         // Kinds of CPU cores
@@ -1083,8 +1083,8 @@ impl PartialEq for Topology {
         #[cfg(feature = "hwloc-2_3_0")]
         {
             if !self
-                .dump_builtin_attributes()
-                .eq_modulo_topology(&other.dump_builtin_attributes())
+                .dump_memory_attributes()
+                .eq_modulo_topology(&other.dump_memory_attributes())
             {
                 return false;
             }
