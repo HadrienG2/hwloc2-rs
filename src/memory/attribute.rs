@@ -24,7 +24,7 @@ use crate::{
         string::LibcString,
         transparent::{AsInner, AsNewtype},
     },
-    object::TopologyObject,
+    object::{TopologyObject, TopologyObjectID},
     topology::{editor::TopologyEditor, Topology},
 };
 use bitflags::bitflags;
@@ -48,6 +48,7 @@ use libc::{EBUSY, EINVAL, ENOENT};
 #[cfg(test)]
 use similar_asserts::assert_eq;
 use std::{
+    collections::HashSet,
     ffi::{c_int, c_uint, c_ulong, CStr},
     fmt::{self, Debug},
     hash::Hash,
@@ -664,8 +665,10 @@ impl MemoryAttributeBuilder<'_, '_> {
     ///
     /// # Errors
     ///
-    /// - [`InconsistentData`] if the number of provided initiators and
+    /// - [`InconsistentDataLen`] if the number of provided initiators and
     ///   attribute values does not match
+    /// - [`MultipleValues`] if multiple values are provided for the same
+    ///   (initiator, target) pair
     /// - [`ForeignInitiator`] if some of the provided initiators are
     ///   [`TopologyObject`]s that do not belong to this [`Topology`]
     /// - [`ForeignTarget`] if some of the provided targets are
@@ -675,9 +678,10 @@ impl MemoryAttributeBuilder<'_, '_> {
     /// - [`UnwantedInitiator`] if initiators were specified for an attribute
     ///   that does not requires them
     ///
-    /// [`InconsistentData`]: ValueInputError::InconsistentData
     /// [`ForeignInitiator`]: InitiatorInputError::ForeignInitiator
     /// [`ForeignTarget`]: ValueInputError::ForeignTarget
+    /// [`InconsistentDataLen`]: ValueInputError::InconsistentDataLen
+    /// [`MultipleValues`]: ValueInputError::MultipleValues
     /// [`NeedInitiator`]: InitiatorInputError::NeedInitiator
     /// [`UnwantedInitiator`]: InitiatorInputError::UnwantedInitiator
     #[doc(alias = "hwloc_memattr_set_value")]
@@ -690,7 +694,7 @@ impl MemoryAttributeBuilder<'_, '_> {
             Vec<(&TopologyObject, u64)>,
         ),
     ) -> Result<(), HybridError<ValueInputError>> {
-        /// Polymorphized subset of this function (avoids generics code bloat)
+        /// Polymorphized subset of this function (reduces generics code bloat)
         ///
         /// # Safety
         ///
@@ -700,30 +704,9 @@ impl MemoryAttributeBuilder<'_, '_> {
         ///   from this memory attribute's topology.
         unsafe fn polymorphized(
             self_: &mut MemoryAttributeBuilder<'_, '_>,
-            initiators: Option<Vec<hwloc_location>>,
-            target_ptrs_and_values: Vec<(NonNull<hwloc_obj>, u64)>,
+            initiators: RawInitiators,
+            target_ptrs_and_values: RawTargetsAndValues,
         ) -> Result<(), HybridError<ValueInputError>> {
-            // Validate initiator and target correctness
-            if self_.flags.contains(MemoryAttributeFlags::NEED_INITIATOR) && initiators.is_none() {
-                return Err(
-                    ValueInputError::BadInitiators(InitiatorInputError::NeedInitiator(
-                        self_.name.clone(),
-                    ))
-                    .into(),
-                );
-            }
-            if !self_.flags.contains(MemoryAttributeFlags::NEED_INITIATOR) && initiators.is_some() {
-                return Err(ValueInputError::BadInitiators(
-                    InitiatorInputError::UnwantedInitiator(self_.name.clone()),
-                )
-                .into());
-            }
-            if let Some(initiators) = &initiators {
-                if initiators.len() != target_ptrs_and_values.len() {
-                    return Err(ValueInputError::InconsistentData.into());
-                }
-            }
-
             // Massage initiators into an iterator of what hwloc wants
             let initiator_ptrs = initiators
                 .iter()
@@ -759,41 +742,143 @@ impl MemoryAttributeBuilder<'_, '_> {
             Ok(())
         }
 
-        // Run user callback, post-process results to fit hwloc and borrow
-        // checker expectations
+        // Run user callback
         let topology = self.editor.topology();
         let (initiators, targets_and_values) = find_values(topology);
-        let initiators = initiators
-            .map(|vec| {
-                vec.into_iter()
-                    // SAFETY: Will only be used before returning from this function
-                    .map(|initiator| unsafe {
-                        initiator.to_checked_raw(topology).map_err(|e| {
-                            ValueInputError::BadInitiators(InitiatorInputError::ForeignInitiator(e))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, ValueInputError>>()
-            })
-            .transpose()
-            .map_err(HybridError::Rust)?;
-        let target_ptrs_and_values = targets_and_values
-            .into_iter()
-            .map(|(target_ref, value)| {
-                if !topology.contains(target_ref) {
-                    return Err(ValueInputError::ForeignTarget(target_ref.into()));
-                }
-                let target_ptr = NonNull::from(target_ref).as_inner();
-                Ok((target_ptr, value))
-            })
-            .collect::<Result<Vec<_>, ValueInputError>>()?;
 
-        // Invoke polymorphized subser with the results
+        // Check user inputs and get them closer to hwloc expectations
+        //
+        // SAFETY: Raw initiators and targets will be used before the end of
+        //         this function, without tampering
+        let (initiators, target_ptrs_and_values) = unsafe {
+            Self::checked_set_values_inputs(
+                self.flags,
+                &self.name,
+                topology,
+                initiators.as_deref(),
+                &targets_and_values[..],
+            )?
+        };
+
+        // Invoke polymorphized subset with the results
         // SAFETY: Initiators and target_ptrs_and_values have been checked to
         //         belong to this memory attribute's topology, and initiators
         //         have not been tampered with.
         unsafe { polymorphized(self, initiators, target_ptrs_and_values) }
     }
+
+    /// Check inputs to `set_values` for usage errors. If everything is alright,
+    /// return lower-level inputs for the polymorphic subset of `set_values`.
+    ///
+    /// # Safety
+    ///
+    /// The output values must be used before the end of the lifetime of the
+    /// `initiators` and `targets_and_values` inputs. Inputs should not have
+    /// been tampered with before this happens.
+    unsafe fn checked_set_values_inputs<'topology>(
+        flags: MemoryAttributeFlags,
+        name: &str,
+        topology: &'topology Topology,
+        initiators: Option<&[MemoryAttributeLocation<'topology>]>,
+        targets_and_values: &[(&'topology TopologyObject, u64)],
+    ) -> Result<(RawInitiators, RawTargetsAndValues), HybridError<ValueInputError>> {
+        // Set up output storage
+        let mut out_initiators = None;
+        let mut target_ptrs_and_values = Vec::with_capacity(targets_and_values.len());
+
+        /// Common code for adding a (target, value) pair + checking the target
+        macro_rules! try_push_target_and_value {
+            ($target_and_value:expr) => {
+                let (target_ref, value): (&TopologyObject, u64) = $target_and_value;
+                if !topology.contains(target_ref) {
+                    return Err(ValueInputError::ForeignTarget(target_ref.into()).into());
+                }
+                let target_ptr = NonNull::from(target_ref).as_inner();
+                target_ptrs_and_values.push((target_ptr, value));
+            };
+        }
+
+        // Case where the user provided initiators
+        if let Some(initiators) = &initiators {
+            // The memory attribute should call for an initiator
+            if !flags.contains(MemoryAttributeFlags::NEED_INITIATOR) {
+                return Err(ValueInputError::BadInitiators(
+                    InitiatorInputError::UnwantedInitiator(name.into()),
+                )
+                .into());
+            }
+
+            // There should be as many initiators as there are targets/values
+            if initiators.len() != targets_and_values.len() {
+                return Err(ValueInputError::InconsistentDataLen.into());
+            }
+
+            /// Simplified [`MemoryAttributeLocation`] that fits in [`HashSet`]
+            #[allow(clippy::missing_docs_in_private_items)]
+            #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+            enum InitiatorId<'a> {
+                CpuSet(BitmapRef<'a, CpuSet>),
+                Object(TopologyObjectID),
+            }
+
+            // Iterate over (initiator, target, value) triplets
+            let mut unique_initiator_targets = HashSet::with_capacity(initiators.len());
+            let out_initiators = out_initiators.insert(Vec::with_capacity(initiators.len()));
+            for (initiator, (target, value)) in
+                initiators.iter().zip(targets_and_values.iter().copied())
+            {
+                // Check for (initiator, target) uniqueness
+                let initiator_id = match initiator {
+                    MemoryAttributeLocation::CpuSet(set) => InitiatorId::CpuSet(*set),
+                    MemoryAttributeLocation::Object(obj) => {
+                        InitiatorId::Object(obj.global_persistent_index())
+                    }
+                };
+                if !unique_initiator_targets
+                    .insert((initiator_id, target.global_persistent_index()))
+                {
+                    return Err(ValueInputError::MultipleValues.into());
+                }
+
+                // Record initiator, target and value into output Vecs
+                out_initiators.push(
+                    // SAFETY: Per function precondition
+                    unsafe {
+                        initiator.to_checked_raw(topology).map_err(|e| {
+                            ValueInputError::BadInitiators(InitiatorInputError::ForeignInitiator(e))
+                        })?
+                    },
+                );
+                try_push_target_and_value!((target, value));
+            }
+        } else {
+            // Case where the user did not provide initiators. This is only
+            // valid if the memory attribute doesn't call for initiators
+            if flags.contains(MemoryAttributeFlags::NEED_INITIATOR) {
+                return Err(
+                    ValueInputError::BadInitiators(InitiatorInputError::NeedInitiator(name.into()))
+                        .into(),
+                );
+            }
+
+            // Record (target, value) pairs, tracking target uniqueness
+            let mut unique_target_ids = HashSet::with_capacity(targets_and_values.len());
+            for (target, value) in targets_and_values.iter().copied() {
+                if !unique_target_ids.insert(target.global_persistent_index()) {
+                    return Err(ValueInputError::MultipleValues.into());
+                }
+                try_push_target_and_value!((target, value));
+            }
+        }
+        Ok((out_initiators, target_ptrs_and_values))
+    }
 }
+
+/// Predigested initiators for [`MemoryAttributeBuilder::set_values`]
+type RawInitiators = Option<Vec<hwloc_location>>;
+
+/// Predigested targets and values for [`MemoryAttributeBuilder::set_values`]
+type RawTargetsAndValues = Vec<(NonNull<hwloc_obj>, u64)>;
 
 /// Error returned by [`MemoryAttributeBuilder::set_values`] when the
 /// `find_values` callback returns incorrect initiators or targets
@@ -801,7 +886,11 @@ impl MemoryAttributeBuilder<'_, '_> {
 pub enum ValueInputError {
     /// The number of provided initiators does not match the number of attribute values
     #[error("number of memory attribute values doesn't match number of initiators")]
-    InconsistentData,
+    InconsistentDataLen,
+
+    /// Multiple values are provided for the same (initiator, target) pair
+    #[error("multiple values provided for the same (initiator, target) pair")]
+    MultipleValues,
 
     /// Specified initiators for these attribute values are not valid
     #[error(transparent)]
@@ -2028,18 +2117,13 @@ crate::impl_arbitrary_for_bitflags!(MemoryAttributeFlags, hwloc_memattr_flag_e);
 mod tests {
     use super::*;
     use crate::{
-        object::{types::ObjectType, TopologyObjectID},
+        object::types::ObjectType,
         strategies::{any_object, any_string, set_with_reference, topology_related_set},
     };
     use proptest::prelude::*;
     #[allow(unused)]
     use similar_asserts::assert_eq;
-    use std::{
-        cmp::Ordering,
-        collections::{HashMap, HashSet},
-        ffi::CString,
-        sync::OnceLock,
-    };
+    use std::{cmp::Ordering, collections::HashMap, ffi::CString, sync::OnceLock};
 
     /// Mechanism to track the best value of a memory attribute and the
     /// endpoints for which the memory attribute has this value.
