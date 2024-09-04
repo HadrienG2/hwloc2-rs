@@ -16,7 +16,7 @@
 #[cfg(doc)]
 use crate::topology::support::DiscoverySupport;
 use crate::{
-    bitmap::{BitmapIndex, BitmapRef},
+    bitmap::{BitmapCow, BitmapIndex, BitmapRef},
     cpu::cpuset::CpuSet,
     errors::{self, FlagsError, ForeignObjectError, HybridError, NulError, RawHwlocError},
     ffi::{
@@ -177,7 +177,7 @@ impl Topology {
         ) -> Result<Vec<&'self_ TopologyObject>, HybridError<ForeignLocationError>> {
             // Prepare to call hwloc
             // SAFETY: Will only be used before returning from this function
-            let (location, flags) = unsafe { target.to_checked_raw(self_)? };
+            let (location, flags) = unsafe { target.as_checked_raw(self_)? };
             let mut nr = 0;
             let call_ffi = |nr_mut, out_ptr| {
                 // SAFETY: - Topology is trusted to contain a valid ptr (type invariant)
@@ -707,7 +707,7 @@ impl MemoryAttributeBuilder<'_, '_> {
         ///
         /// # Safety
         ///
-        /// - `initiators` must have just gone through the `to_checked_raw()`
+        /// - `initiators` must have just gone through the `as_checked_raw()`
         ///   validation process against this attribute's topology.
         /// - `target_ptrs_and_values` must only contain pointers to objects
         ///   from this memory attribute's topology.
@@ -855,7 +855,7 @@ impl MemoryAttributeBuilder<'_, '_> {
                 out_initiators.push(
                     // SAFETY: Per function precondition
                     unsafe {
-                        initiator.to_checked_raw(topology).map_err(|e| {
+                        initiator.as_checked_raw(topology).map_err(|e| {
                             ValueInputError::BadInitiators(InitiatorInputError::ForeignInitiator(e))
                         })?
                     },
@@ -1756,7 +1756,7 @@ impl<'topology> MemoryAttribute<'topology> {
         // SAFETY: Per function precondition on output usage
         unsafe {
             initiator
-                .to_checked_raw(self.topology)
+                .as_checked_raw(self.topology)
                 .map_err(InitiatorInputError::ForeignInitiator)
         }
     }
@@ -1841,7 +1841,7 @@ pub enum ValueQueryError {
 #[doc(alias = "hwloc_location_u")]
 #[doc(alias = "hwloc_location::hwloc_location_u")]
 #[doc(alias = "hwloc_location_type_e")]
-#[derive(Clone, Copy, Debug, Display)]
+#[derive(Clone, Debug, Display)]
 pub enum MemoryAttributeLocation<'target> {
     /// Directly provide CPU set to find NUMA nodes with corresponding locality
     ///
@@ -1849,7 +1849,7 @@ pub enum MemoryAttributeLocation<'target> {
     /// queries on hwloc-defined memory attributes, though `Object` remains an
     /// option for user-defined memory attributes.
     #[doc(alias = "HWLOC_LOCATION_TYPE_CPUSET")]
-    CpuSet(BitmapRef<'target, CpuSet>),
+    CpuSet(BitmapCow<'target, CpuSet>),
 
     /// Use a topology object as an initiator
     ///
@@ -1877,13 +1877,13 @@ impl<'target> MemoryAttributeLocation<'target> {
     /// # Safety
     ///
     /// Do not use the output after the source lifetime has expired
-    pub(crate) unsafe fn to_checked_raw(
-        self,
+    pub(crate) unsafe fn as_checked_raw(
+        &self,
         topology: &Topology,
     ) -> Result<hwloc_location, ForeignLocationError> {
         match self {
             Self::CpuSet(cpuset) => {
-                if topology.complete_cpuset().includes(cpuset) {
+                if topology.complete_cpuset().includes(cpuset.as_ref()) {
                     Ok(hwloc_location {
                         ty: HWLOC_LOCATION_TYPE_CPUSET,
                         location: hwloc_location_u {
@@ -1891,7 +1891,7 @@ impl<'target> MemoryAttributeLocation<'target> {
                         },
                     })
                 } else {
-                    Err(cpuset.into())
+                    Err(cpuset.clone().into_owned().into())
                 }
             }
             Self::Object(object) => {
@@ -1903,7 +1903,7 @@ impl<'target> MemoryAttributeLocation<'target> {
                         },
                     })
                 } else {
-                    Err(object.into())
+                    Err((*object).into())
                 }
             }
         }
@@ -1931,7 +1931,7 @@ impl<'target> MemoryAttributeLocation<'target> {
                     let ptr = NonNull::new(raw.location.cpuset.cast_mut())
                         .expect("Unexpected null CpuSet from hwloc");
                     let cpuset = CpuSet::borrow_from_nonnull(ptr);
-                    Ok(MemoryAttributeLocation::CpuSet(cpuset))
+                    Ok(MemoryAttributeLocation::from(cpuset))
                 }
                 HWLOC_LOCATION_TYPE_OBJECT => {
                     let ptr = NonNull::new(raw.location.object.cast_mut())
@@ -1944,9 +1944,21 @@ impl<'target> MemoryAttributeLocation<'target> {
     }
 }
 //
+impl<'target> From<CpuSet> for MemoryAttributeLocation<'target> {
+    fn from(cpuset: CpuSet) -> Self {
+        BitmapCow::from(cpuset).into()
+    }
+}
+//
+impl<'target> From<BitmapCow<'target, CpuSet>> for MemoryAttributeLocation<'target> {
+    fn from(cpuset: BitmapCow<'target, CpuSet>) -> Self {
+        Self::CpuSet(cpuset)
+    }
+}
+//
 impl<'target> From<BitmapRef<'target, CpuSet>> for MemoryAttributeLocation<'target> {
     fn from(cpuset: BitmapRef<'target, CpuSet>) -> Self {
-        Self::CpuSet(cpuset)
+        BitmapCow::from(cpuset).into()
     }
 }
 //
@@ -1981,9 +1993,9 @@ impl From<&TopologyObject> for ForeignLocationError {
     }
 }
 //
-impl From<BitmapRef<'_, CpuSet>> for ForeignLocationError {
-    fn from(set: BitmapRef<'_, CpuSet>) -> Self {
-        Self::CpuSet(set.clone_target())
+impl From<CpuSet> for ForeignLocationError {
+    fn from(set: CpuSet) -> Self {
+        Self::CpuSet(set)
     }
 }
 //
@@ -2050,7 +2062,7 @@ bitflags! {
 crate::impl_arbitrary_for_bitflags!(LocalNUMANodeFlags, hwloc_local_numanode_flag_e);
 
 /// Scope of a [`Topology::local_numa_nodes()`] query
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum NUMALocation<'target> {
     /// Nodes local to some object
     Local {
@@ -2084,8 +2096,8 @@ impl NUMALocation<'_> {
     /// # Safety
     ///
     /// Do not use the output raw location after the source lifetime has expired
-    pub(crate) unsafe fn to_checked_raw(
-        self,
+    pub(crate) unsafe fn as_checked_raw(
+        &self,
         topology: &Topology,
     ) -> Result<(hwloc_location, LocalNUMANodeFlags), ForeignLocationError> {
         match self {
@@ -2095,7 +2107,7 @@ impl NUMALocation<'_> {
             } => {
                 flags.remove(LocalNUMANodeFlags::ALL);
                 // SAFETY: Per function precondition
-                Ok((unsafe { location.to_checked_raw(topology)? }, flags))
+                Ok((unsafe { location.as_checked_raw(topology)? }, flags))
             }
             // SAFETY: In presence of the ALL flag, the initiator is ignored,
             //         so a null location is fine.
@@ -2185,7 +2197,7 @@ mod tests {
         best_endpoints: Vec<Endpoint>,
     }
     //
-    impl<Endpoint: Copy> BestValueEndpoints<Endpoint> {
+    impl<Endpoint> BestValueEndpoints<Endpoint> {
         fn new(higher_is_best: bool) -> Self {
             Self {
                 higher_is_best,
@@ -2214,16 +2226,16 @@ mod tests {
     }
 
     /// Unique initiator identifier
-    #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-    enum InitiatorKey<'a> {
-        CpuSet(BitmapRef<'a, CpuSet>),
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    enum InitiatorKey {
+        CpuSet(CpuSet),
         Object(TopologyObjectID),
     }
     //
-    impl<'a> From<MemoryAttributeLocation<'a>> for InitiatorKey<'a> {
-        fn from(x: MemoryAttributeLocation<'a>) -> Self {
+    impl From<MemoryAttributeLocation<'_>> for InitiatorKey {
+        fn from(x: MemoryAttributeLocation<'_>) -> Self {
             match x {
-                MemoryAttributeLocation::CpuSet(set) => Self::CpuSet(set),
+                MemoryAttributeLocation::CpuSet(set) => Self::CpuSet(set.into_owned()),
                 MemoryAttributeLocation::Object(obj) => Self::Object(obj.global_persistent_index()),
             }
         }
@@ -2279,9 +2291,9 @@ mod tests {
             let (initiators, values) = attr.initiators(target).unwrap();
             let mut expected_best_initiators = BestValueEndpoints::new(higher_is_best);
             for (initiator, value) in initiators.into_iter().zip(values) {
-                assert_eq!(attr.value(Some(initiator), target), Ok(Some(value)));
-                let initiator_key = InitiatorKey::from(initiator);
-                key_to_initiator.insert(initiator_key, initiator);
+                assert_eq!(attr.value(Some(initiator.clone()), target), Ok(Some(value)));
+                let initiator_key = InitiatorKey::from(initiator.clone());
+                key_to_initiator.insert(initiator_key.clone(), initiator.clone());
                 let inserted = initiator_key_to_target_ids_and_values
                     .entry(initiator_key)
                     .or_default()
@@ -2301,11 +2313,11 @@ mod tests {
             {
                 assert_eq!(best_value, expected_best_value);
                 assert!(expected_best_initiators.into_iter().any(|initiator| {
-                    match (initiator, best_initiator) {
+                    match (initiator, &best_initiator) {
                         (
                             MemoryAttributeLocation::CpuSet(set1),
                             MemoryAttributeLocation::CpuSet(set2),
-                        ) => set1 == set2,
+                        ) => set1 == *set2,
                         (
                             MemoryAttributeLocation::Object(obj1),
                             MemoryAttributeLocation::Object(obj2),
@@ -2319,8 +2331,8 @@ mod tests {
         // For each initiator...
         for (initiator_key, target_ids_and_values) in initiator_key_to_target_ids_and_values {
             // Check targets, find best targets
-            let initiator = key_to_initiator[&initiator_key];
-            let (targets, values) = attr.targets(Some(initiator)).unwrap();
+            let initiator = &key_to_initiator[&initiator_key];
+            let (targets, values) = attr.targets(Some(initiator.clone())).unwrap();
             let values = values.unwrap();
             assert_eq!(targets.len(), values.len());
             assert_eq!(targets.len(), target_ids_and_values.len());
@@ -2332,7 +2344,7 @@ mod tests {
 
             // Check best target
             let expected_best_targets = expected_best_targets.collect_value_and_endpoints();
-            let best_target = attr.best_target(Some(initiator)).unwrap();
+            let best_target = attr.best_target(Some(initiator.clone())).unwrap();
             assert_eq!(expected_best_targets.is_none(), best_target.is_none());
             if let (
                 Some((expected_best_targets, expected_best_value)),
@@ -2453,29 +2465,12 @@ mod tests {
         }
     }
 
-    /// Owned version of [`MemoryAttributeLocation`] for testing
-    #[derive(Clone, Debug)]
-    enum OwnedAttributeLocation {
-        CpuSet(CpuSet),
-        Object(&'static TopologyObject),
-    }
-    //
-    fn borrow_owned_initiator(
-        initiator: &Option<OwnedAttributeLocation>,
-    ) -> Option<MemoryAttributeLocation<'_>> {
-        match initiator {
-            Some(OwnedAttributeLocation::CpuSet(set)) => Some(MemoryAttributeLocation::from(set)),
-            Some(OwnedAttributeLocation::Object(obj)) => Some(MemoryAttributeLocation::from(*obj)),
-            None => None,
-        }
-    }
-
     /// Pick a memory attribute initiator that has a low odd of being valid
-    fn any_initiator() -> impl Strategy<Value = Option<OwnedAttributeLocation>> {
+    fn any_initiator() -> impl Strategy<Value = Option<MemoryAttributeLocation<'static>>> {
         prop_oneof![
             topology_related_set(Topology::cpuset)
-                .prop_map(|set| Some(OwnedAttributeLocation::CpuSet(set))),
-            any_object().prop_map(|obj| Some(OwnedAttributeLocation::Object(obj)))
+                .prop_map(|set| Some(MemoryAttributeLocation::from(set))),
+            any_object().prop_map(|obj| Some(MemoryAttributeLocation::from(obj)))
         ]
     }
 
@@ -2486,7 +2481,7 @@ mod tests {
         Value = (
             MemoryAttribute<'static>,
             &'static TopologyObject,
-            Option<OwnedAttributeLocation>,
+            Option<MemoryAttributeLocation<'static>>,
         ),
     > {
         memory_attribute_and_target().prop_flat_map(move |(attr, target)| {
@@ -2506,11 +2501,11 @@ mod tests {
                             match actual_initiator {
                                 MemoryAttributeLocation::CpuSet(set) => {
                                     set_with_reference(set)
-                                        .prop_map(|set| Some(OwnedAttributeLocation::CpuSet(set)))
+                                        .prop_map(|set| Some(MemoryAttributeLocation::from(set)))
                                         .boxed()
                                 }
                                 MemoryAttributeLocation::Object(obj) => {
-                                    Just(Some(OwnedAttributeLocation::Object(obj)))
+                                    Just(Some(MemoryAttributeLocation::from(obj)))
                                         .boxed()
                                 }
                             }
@@ -2545,7 +2540,7 @@ mod tests {
 
             // Detect errors which are handled on the Rust side
             let foreign_initiator = matches!(initiator,
-                Some(OwnedAttributeLocation::Object(obj)) if !attr.topology.contains(obj)
+                Some(MemoryAttributeLocation::Object(obj)) if !attr.topology.contains(obj)
             );
             let foreign_target = !attr.topology.contains(target);
             let attr_needs_initiator = attr.flags().contains(MemoryAttributeFlags::NEED_INITIATOR);
@@ -2564,10 +2559,10 @@ mod tests {
                 }
                 let (initiators, _values) = attr.initiators(candidate).unwrap();
                 initiators.iter().all(|candidate| match (candidate, &initiator) {
-                    (MemoryAttributeLocation::CpuSet(candidate), Some(OwnedAttributeLocation::CpuSet(set))) => {
-                        !candidate.includes(set)
+                    (MemoryAttributeLocation::CpuSet(candidate), Some(MemoryAttributeLocation::CpuSet(set))) => {
+                        !candidate.includes(set.as_ref())
                     }
-                    (MemoryAttributeLocation::Object(candidate), Some(OwnedAttributeLocation::Object(obj))) => {
+                    (MemoryAttributeLocation::Object(candidate), Some(MemoryAttributeLocation::Object(obj))) => {
                         candidate.global_persistent_index() != obj.global_persistent_index()
                     },
                     _ => true,
@@ -2575,7 +2570,7 @@ mod tests {
             });
 
             // Call value query and check result
-            match attr.value(borrow_owned_initiator(&initiator), target) {
+            match attr.value(initiator.clone(), target) {
                 Ok(value) => {
                     prop_assert!(!any_error);
                     // NOTE: Right now we're only testing this direction because
@@ -2590,7 +2585,7 @@ mod tests {
                         InitiatorInputError::ForeignInitiator(fi) => {
                             prop_assert!(foreign_initiator);
                             prop_assert!(initiator.is_some());
-                            prop_assert_eq!(fi, ForeignLocationError::from(borrow_owned_initiator(&initiator).unwrap()));
+                            prop_assert_eq!(fi, ForeignLocationError::from(initiator.unwrap()));
                         }
                         InitiatorInputError::NeedInitiator(_) => prop_assert!(need_initiator),
                         InitiatorInputError::UnwantedInitiator(_) => prop_assert!(unwanted_initiator),
@@ -2605,8 +2600,12 @@ mod tests {
     /// Given a memory attribute, pick an initiator that has a chance of being
     /// correct for this attribute, but may be a random object possibly coming
     /// from another topology.
-    fn memory_attribute_and_initiator(
-    ) -> impl Strategy<Value = (MemoryAttribute<'static>, Option<OwnedAttributeLocation>)> {
+    fn memory_attribute_and_initiator() -> impl Strategy<
+        Value = (
+            MemoryAttribute<'static>,
+            Option<MemoryAttributeLocation<'static>>,
+        ),
+    > {
         memory_attribute_target_initiator().prop_map(|(attr, _target, initiator)| (attr, initiator))
     }
 
@@ -2616,7 +2615,7 @@ mod tests {
             (attr, initiator) in memory_attribute_and_initiator()
         ) {
             let foreign_initiator = matches!(initiator,
-                Some(OwnedAttributeLocation::Object(obj)) if !attr.topology.contains(obj)
+                Some(MemoryAttributeLocation::Object(obj)) if !attr.topology.contains(obj)
             );
             let attr_needs_initiator = attr.flags().contains(MemoryAttributeFlags::NEED_INITIATOR);
             let need_initiator = attr_needs_initiator && initiator.is_none();
@@ -2638,9 +2637,8 @@ mod tests {
                 Ok(())
             };
 
-            let initiator = borrow_owned_initiator(&initiator);
             check_normalized_error(
-                attr.best_target(initiator).map(std::mem::drop),
+                attr.best_target(initiator.clone()).map(std::mem::drop),
                 false,
             )?;
             check_normalized_error(
@@ -2655,25 +2653,15 @@ mod tests {
         }
     }
 
-    /// Owned version of [`NUMALocation`]
-    #[derive(Clone, Debug)]
-    enum OwnedNUMALocation {
-        Local {
-            location: OwnedAttributeLocation,
-            flags: LocalNUMANodeFlags,
-        },
-        All,
-    }
-
-    /// Generate an `OwnedNUMALocation`
-    fn numa_location() -> impl Strategy<Value = OwnedNUMALocation> {
+    /// Generate a `NUMALocation`
+    fn numa_location() -> impl Strategy<Value = NUMALocation<'static>> {
         let topology = Topology::test_instance();
         prop_oneof![
-            1 => Just(OwnedNUMALocation::All),
+            1 => Just(NUMALocation::All),
             2 => {
                 (any_object(), any::<LocalNUMANodeFlags>()).prop_map(|(obj, flags)| {
-                    OwnedNUMALocation::Local {
-                        location: OwnedAttributeLocation::Object(obj),
+                    NUMALocation::Local {
+                        location: MemoryAttributeLocation::from(obj),
                         flags,
                     }
                 })
@@ -2684,8 +2672,8 @@ mod tests {
                 }).collect::<Vec<_>>();
                 prop::sample::select(numa_nodes).prop_flat_map(|numa| {
                     (set_with_reference(numa.cpuset().unwrap()), any::<LocalNUMANodeFlags>()).prop_map(|(set, flags)| {
-                        OwnedNUMALocation::Local {
-                            location: OwnedAttributeLocation::CpuSet(set),
+                        NUMALocation::Local {
+                            location: MemoryAttributeLocation::from(set),
                             flags,
                         }
                     })
@@ -2698,17 +2686,7 @@ mod tests {
         #[test]
         fn local_numa_nodes(location in numa_location()) {
             let topology = Topology::test_instance();
-            let location = match &location {
-                OwnedNUMALocation::Local { location, flags } => {
-                    let location = match location {
-                        OwnedAttributeLocation::Object(obj) => MemoryAttributeLocation::from(*obj),
-                        OwnedAttributeLocation::CpuSet(set) => MemoryAttributeLocation::from(set),
-                    };
-                    NUMALocation::Local { location, flags: *flags }
-                }
-                OwnedNUMALocation::All => NUMALocation::All,
-            };
-            let res = topology.local_numa_nodes(location);
+            let res = topology.local_numa_nodes(location.clone());
 
             let foreign_object = if let NUMALocation::Local { location: MemoryAttributeLocation::Object(obj), .. } = location {
                 !topology.contains(obj)
@@ -2737,6 +2715,7 @@ mod tests {
                                                      .unwrap()
                                                      .cpuset()
                                                      .unwrap())
+                               .into()
                         }
                     };
                     let expected_node_ids = topology
@@ -2745,7 +2724,7 @@ mod tests {
                             let node_cpuset = node.cpuset().unwrap();
                             let flags = flags - LocalNUMANodeFlags::ALL;
                             let is_match = (flags == LocalNUMANodeFlags::empty() && node_cpuset == cpuset)
-                                || (flags.contains(LocalNUMANodeFlags::LARGER_LOCALITY) && node_cpuset.includes(cpuset))
+                                || (flags.contains(LocalNUMANodeFlags::LARGER_LOCALITY) && node_cpuset.includes(cpuset.as_ref()))
                                 || (flags.contains(LocalNUMANodeFlags::SMALLER_LOCALITY) && cpuset.includes(node_cpuset));
                             is_match.then(|| node.global_persistent_index())
                         })
@@ -2853,7 +2832,7 @@ mod tests {
     fn attribute_building_blocks() -> impl Strategy<
         Value = (
             MemoryAttributeFlags,
-            Option<Vec<OwnedAttributeLocation>>,
+            Option<Vec<MemoryAttributeLocation<'static>>>,
             Vec<(&'static TopologyObject, u64)>,
         ),
     > {
@@ -2961,8 +2940,8 @@ mod tests {
                     (initiator_sets, initiator_objs)
                         .prop_map(|(sets, objs)| {
                             sets.into_iter()
-                                .map(OwnedAttributeLocation::CpuSet)
-                                .chain(objs.into_iter().map(OwnedAttributeLocation::Object))
+                                .map(MemoryAttributeLocation::from)
+                                .chain(objs.into_iter().map(MemoryAttributeLocation::from))
                                 .collect::<Vec<_>>()
                         })
                         .prop_shuffle()
@@ -3013,9 +2992,9 @@ mod tests {
                         .map(|obj| (obj.global_persistent_index(), obj))
                         .collect::<HashMap<_, _>>();
                     let initiators = initiators.as_ref().map(|initiators| {
-                        initiators.iter().map(|initiator| {
+                        initiators.iter().cloned().map(|initiator| {
                             match initiator {
-                                OwnedAttributeLocation::Object(obj) => {
+                                MemoryAttributeLocation::Object(obj) => {
                                     let obj = if initial_topology.contains(obj) {
                                         id_to_object[&obj.global_persistent_index()]
                                     } else {
@@ -3023,7 +3002,7 @@ mod tests {
                                     };
                                     MemoryAttributeLocation::from(obj)
                                 }
-                                OwnedAttributeLocation::CpuSet(set) => {
+                                MemoryAttributeLocation::CpuSet(set) => {
                                     MemoryAttributeLocation::from(set)
                                 }
                             }

@@ -8,7 +8,7 @@ use crate::Sealed;
 use crate::{cpu::cpuset::CpuSet, memory::nodeset::NodeSet};
 use std::{
     borrow::{Borrow, BorrowMut},
-    fmt::{Debug, Display},
+    fmt::{Debug, Display, Pointer},
     ops::Deref,
     ptr::NonNull,
 };
@@ -36,6 +36,7 @@ pub unsafe trait OwnedBitmap:
     + From<Bitmap>
     + Into<Bitmap>
     + PartialEq
+    + Pointer
     + Sealed
     + 'static
 {

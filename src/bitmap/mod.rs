@@ -48,6 +48,7 @@
 //
 // Main docs: https://hwloc.readthedocs.io/en/v2.9/group__hwlocality__bitmap.html
 
+mod cow;
 mod newtypes;
 mod reference;
 
@@ -86,6 +87,7 @@ pub type BitmapIndex = PositiveInt;
 
 // Re-export BitmapRef so users don't need to know about the reference submodule
 pub use self::{
+    cow::BitmapCow,
     newtypes::{BitmapKind, OwnedBitmap, SpecializedBitmap, SpecializedBitmapRef},
     reference::BitmapRef,
 };

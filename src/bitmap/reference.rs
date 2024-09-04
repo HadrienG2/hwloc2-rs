@@ -53,7 +53,10 @@ use std::{
 //   arises we will need to add BitmapMut<Target>
 #[repr(transparent)]
 #[derive(Clone)]
-pub struct BitmapRef<'target, Target>(NonNull<hwloc_bitmap_s>, PhantomData<&'target Target>);
+pub struct BitmapRef<'target, Target: OwnedBitmap>(
+    NonNull<hwloc_bitmap_s>,
+    PhantomData<&'target Target>,
+);
 
 impl<'target, Target: OwnedBitmap> BitmapRef<'target, Target> {
     /// Wrap a borrowed hwloc bitmap
@@ -307,7 +310,7 @@ where
     }
 }
 
-impl<Target> Pointer for BitmapRef<'_, Target> {
+impl<Target: OwnedBitmap> Pointer for BitmapRef<'_, Target> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         <NonNull<hwloc_bitmap_s> as fmt::Pointer>::fmt(&self.0, f)
     }
